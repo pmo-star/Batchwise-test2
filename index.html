@@ -476,6 +476,8 @@ function App() {
   const [sortKey, setSortKey] = useState(null);
   const [sortDir, setSortDir] = useState('desc');
   const [search, setSearch] = useState('');
+  const [selectedMachine, setSelectedMachine] = useState('');
+  const [selectedBatch, setSelectedBatch] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [uploading, setUploading] = useState(false);
@@ -589,6 +591,21 @@ function App() {
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).map(k => display[k]);
   }, [deptRows]);
 
+  // batch numbers available right now (current department + date range) —
+  // narrowed to the currently selected machine, if one is picked in the
+  // Machine dropdown, so the Batch list only shows batches that actually
+  // ran on that machine instead of every batch in the department.
+  const batchOptions = useMemo(() => {
+    const normM = selectedMachine ? normKey(selectedMachine) : null;
+    const totals = {};
+    deptRows.forEach(r => {
+      if (!r.batch) return;
+      if (normM && normKey(r.wc) !== normM) return;
+      totals[r.batch] = (totals[r.batch] || 0) + r.qty;
+    });
+    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]);
+  }, [deptRows, selectedMachine]);
+
   const alloyOptions = useMemo(() => {
     const totals = {};
     deptRows.forEach(r => {
@@ -600,14 +617,24 @@ function App() {
 
   const searchedAllRows = useMemo(() => {
     if (!allRows) return allRows;
-    if (!search.trim()) return allRows;
-    const q = search.trim().toLowerCase();
-    return allRows.filter(r =>
-      (r.mat || '').toLowerCase().includes(q) ||
-      (r.wc || '').toLowerCase().includes(q) ||
-      (r.matCode || '').toLowerCase().includes(q)
-    );
-  }, [allRows, search]);
+    let result = allRows;
+    if (selectedMachine) {
+      const normM = normKey(selectedMachine);
+      result = result.filter(r => normKey(r.wc || '') === normM);
+    }
+    if (selectedBatch) {
+      result = result.filter(r => r.batch === selectedBatch);
+    }
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      result = result.filter(r =>
+        (r.mat || '').toLowerCase().includes(q) ||
+        (r.wc || '').toLowerCase().includes(q) ||
+        (r.matCode || '').toLowerCase().includes(q)
+      );
+    }
+    return result;
+  }, [allRows, search, selectedMachine, selectedBatch]);
 
   const allTimeAlloyOptions = useMemo(() => {
     if (!searchedAllRows) return [];
@@ -644,6 +671,20 @@ function App() {
     setSortDir('desc');
   }, [view]);
 
+  // a machine/alloy/batch picked in one department won't exist in another,
+  // so switching departments clears whatever filter was active
+  useEffect(() => {
+    setSearch('');
+    setSelectedMachine('');
+    setSelectedBatch('');
+  }, [department]);
+
+  // if the selected batch doesn't belong to the newly-selected machine,
+  // drop it rather than silently filtering everything down to nothing
+  useEffect(() => {
+    if (selectedBatch && !batchOptions.includes(selectedBatch)) setSelectedBatch('');
+  }, [batchOptions, selectedBatch]);
+
   const aggregated = useMemo(() => {
     if (view === 'wc') return aggregateBy(deptRows, r => r.date + '||' + normKey(r.wc), r => normKey(r.wc));
     if (view === 'alloy') return aggregateBy(
@@ -666,14 +707,24 @@ function App() {
   }, [deptRows, view]);
 
   const filtered = useMemo(() => {
-    if (!search.trim()) return aggregated;
-    const q = search.trim().toLowerCase();
-    return aggregated.filter(r =>
-      r.name.toLowerCase().includes(q) ||
-      (r.wc || '').toLowerCase().includes(q) ||
-      (r.matCode || '').toLowerCase().includes(q)
-    );
-  }, [aggregated, search]);
+    let result = aggregated;
+    if (selectedMachine) {
+      const normM = normKey(selectedMachine);
+      result = result.filter(r => normKey(r.wc || '') === normM);
+    }
+    if (selectedBatch && view === 'batch') {
+      result = result.filter(r => r.name === selectedBatch);
+    }
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      result = result.filter(r =>
+        r.name.toLowerCase().includes(q) ||
+        (r.wc || '').toLowerCase().includes(q) ||
+        (r.matCode || '').toLowerCase().includes(q)
+      );
+    }
+    return result;
+  }, [aggregated, search, selectedMachine, selectedBatch, view]);
 
   const sortedFiltered = useMemo(() => {
     if (!sortKey) return filtered;
@@ -738,6 +789,8 @@ function App() {
   }, [filtered]);
 
   const activeFilters = [];
+  if (selectedMachine) activeFilters.push({ key: 'machine', label: 'Machine: "' + selectedMachine + '"', clear: () => setSelectedMachine('') });
+  if (selectedBatch) activeFilters.push({ key: 'batch', label: 'Batch: "' + selectedBatch + '"', clear: () => setSelectedBatch('') });
   if (search.trim()) activeFilters.push({ key: 'search', label: 'Search: "' + search.trim() + '"', clear: () => setSearch('') });
 
   const fmt = n => Math.round(n).toLocaleString('en-IN');
@@ -779,7 +832,9 @@ function App() {
           dateIndex={dateIndex} fromDate={fromDate} setFromDate={setFromDate} toDate={toDate} setToDate={setToDate}
           department={department} setDepartment={setDepartment}
           view={view} setView={setView} hasBatch={hasBatch}
-          machineOptions={machineOptions} search={search} setSearch={setSearch}
+          machineOptions={machineOptions} batchOptions={batchOptions}
+          selectedMachine={selectedMachine} setSelectedMachine={setSelectedMachine}
+          selectedBatch={selectedBatch} setSelectedBatch={setSelectedBatch}
         />
 
         {activeFilters.length > 0 && (
@@ -823,6 +878,19 @@ function App() {
             <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeMachineOptions}
               groupField="wc" fromDate={fromDate} toDate={toDate}
               ariaLabel="Line chart of Rs per kg cost over time, one line per machine. Hover a point to see quantity." />
+          </div>
+        )}
+
+        {!loading && !error && view === 'batch' && sortedFiltered.length > 0 && (
+          <div style={{
+            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+            padding: '16px 16px 8px', marginBottom: 16
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg by batch</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>({department}, this selection — top 25 shown, hover a bar for qty)</span>
+            </div>
+            <BatchRateBarChart rows={sortedFiltered} />
           </div>
         )}
 
@@ -1047,7 +1115,7 @@ function DateRangeCalendarPicker({ dateIndex, fromDate, setFromDate, toDate, set
   );
 }
 
-function FilterBar({ dateIndex, fromDate, setFromDate, toDate, setToDate, department, setDepartment, view, setView, hasBatch, machineOptions, search, setSearch }) {
+function FilterBar({ dateIndex, fromDate, setFromDate, toDate, setToDate, department, setDepartment, view, setView, hasBatch, machineOptions, batchOptions, selectedMachine, setSelectedMachine, selectedBatch, setSelectedBatch }) {
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10, margin: '4px 0 18px' }}>
       <DateRangeCalendarPicker
@@ -1075,13 +1143,28 @@ function FilterBar({ dateIndex, fromDate, setFromDate, toDate, setToDate, depart
 
       {machineOptions && machineOptions.length > 0 && (
         <select
-          value={machineOptions.includes(search) ? search : ''}
-          onChange={e => setSearch(e.target.value)}
+          value={selectedMachine}
+          onChange={e => setSelectedMachine(e.target.value)}
           className="focus-ring"
           style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)', fontWeight: 600 }}
         >
           <option value="">All machines</option>
           {machineOptions.map(m => <option key={m} value={m}>{m}</option>)}
+        </select>
+      )}
+
+      {batchOptions && batchOptions.length > 0 && (
+        <select
+          value={selectedBatch}
+          onChange={e => {
+            setSelectedBatch(e.target.value);
+            if (e.target.value) setView('batch');
+          }}
+          className="focus-ring"
+          style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)', fontWeight: 600 }}
+        >
+          <option value="">All batches</option>
+          {batchOptions.map(b => <option key={b} value={b}>{b}</option>)}
         </select>
       )}
     </div>
@@ -1262,6 +1345,62 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
       <div style={{ position: 'relative', height: 280 }}>
         <canvas ref={canvasRef} role="img" aria-label={ariaLabel || "Line chart of Rs per kg cost over time. Hover a point to see quantity."}></canvas>
       </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   BATCH RATE BAR CHART (vertical bar: Batch on X axis,
+   Rs/kg on Y axis, for the current selection)
+============================================================ */
+function BatchRateBarChart({ rows }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+  // cap so the chart stays readable — the table below already shows every row
+  const capped = useMemo(() => rows.slice(0, 25), [rows]);
+
+  useEffect(() => {
+    if (!canvasRef.current || typeof Chart === 'undefined') return;
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'bar',
+      data: {
+        labels: capped.map(r => r.name),
+        datasets: [{
+          data: capped.map(r => r.rate),
+          backgroundColor: '#B54E2E',
+          borderRadius: 4,
+          barThickness: 20
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: ctx => ctx.parsed.y.toFixed(2) + ' Rs/kg',
+              afterLabel: ctx => Math.round(capped[ctx.dataIndex].qty).toLocaleString('en-IN') + ' kg'
+            }
+          }
+        },
+        scales: {
+          x: { grid: { display: false }, ticks: { font: { size: 11 }, maxRotation: 45, autoSkip: false } },
+          y: { title: { display: true, text: 'Rs / kg' }, beginAtZero: true, grid: { color: '#E7E2D8' } }
+        }
+      }
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [capped]);
+
+  if (!capped.length) {
+    return <div style={{ fontSize: 13, color: 'var(--ink-2)', padding: '12px 0' }}>No batch data yet.</div>;
+  }
+
+  return (
+    <div style={{ position: 'relative', height: 320 }}>
+      <canvas ref={canvasRef} role="img" aria-label="Bar chart of Rs per kg cost, one bar per batch. Batch numbers on the X axis, Rs per kg on the Y axis."></canvas>
     </div>
   );
 }
