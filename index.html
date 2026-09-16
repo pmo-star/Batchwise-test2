@@ -237,6 +237,37 @@ function keyToLabel(key) {
   return d + ' ' + months[parseInt(m, 10) - 1] + ' ' + y;
 }
 
+// Parses Batch No. Start/End Time into a millisecond timestamp. Handles the
+// three shapes a cell can arrive in: an Excel serial number (from xlsx.js
+// with raw:true), a JS Date (some readers convert automatically), or plain
+// text like "2025-05-26 19:06:23" (always the case when read from a PDF).
+function parseDateTimeMs(val) {
+  if (val == null || val === '') return null;
+  if (typeof val === 'number' && isFinite(val)) {
+    // Excel serial date, fractional part is time-of-day — keep full precision
+    return Date.UTC(1899, 11, 30) + val * 86400000;
+  }
+  if (val instanceof Date && !isNaN(val)) return val.getTime();
+  if (typeof val === 'string') {
+    const s = val.trim();
+    const m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/);
+    if (m) {
+      return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+    }
+    const d = new Date(s);
+    if (!isNaN(d)) return d.getTime();
+  }
+  return null;
+}
+
+function formatDateTime(ms) {
+  if (ms == null) return '-';
+  const d = new Date(ms);
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const pad = n => String(n).padStart(2, '0');
+  return pad(d.getUTCDate()) + ' ' + months[d.getUTCMonth()] + ' ' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds());
+}
+
 function normKey(s) {
   return (s || '').trim().replace(/\s+/g, ' ').toUpperCase();
 }
@@ -310,6 +341,8 @@ async function parseWorkbook(arrayBuffer, isPdf) {
   const batchCol = findCol(headers, ['Batch']);
   const dateCol = findCol(headers, ['Posting Date'], ['posting', 'date']);
   const qtyCol = findCol(headers, ['Quantity', 'Qty'], ['qty'], ['unit']);
+  const startTimeCol = findCol(headers, ['Batch No. Start Time'], ['start', 'time'], ['end']);
+  const endTimeCol = findCol(headers, ['Batch No. End Time'], ['end', 'time'], ['start']);
 
   const storeDCols = findCostColumns(headers, 'Store Direct', 'storeD');
   const storeICols = findCostColumns(headers, 'Store Indirect', 'storeI');
@@ -350,6 +383,9 @@ async function parseWorkbook(arrayBuffer, isPdf) {
     const matCode = matCodeCol !== -1 ? (r[matCodeCol] || '').toString().trim() : '';
     const batch = batchCol !== -1 ? (r[batchCol] || '').toString().trim() : '';
     const qty = num(r[qtyCol]);
+    const startTime = startTimeCol !== -1 ? parseDateTimeMs(r[startTimeCol]) : null;
+    const endTime = endTimeCol !== -1 ? parseDateTimeMs(r[endTimeCol]) : null;
+    const runTime = (startTime != null && endTime != null) ? (endTime - startTime) / 60000 : null;
 
     const row = {
       dept,
@@ -358,6 +394,9 @@ async function parseWorkbook(arrayBuffer, isPdf) {
       matCode: matCode || null,
       batch: batch || null,
       qty,
+      startTime,
+      endTime,
+      runTime,
       storeD: costValue(r, storeDCols, qty),
       storeI: costValue(r, storeICols, qty),
       labD: costValue(r, labDCols, qty),
@@ -390,6 +429,9 @@ function aggregateBy(rows, keyFn, nameFn) {
       buckets[k] = {
         name: nameFn ? nameFn(r) : k,
         date: r.date,
+        startTime: r.startTime != null ? r.startTime : null,
+        endTime: r.endTime != null ? r.endTime : null,
+        runTime: r.runTime != null ? r.runTime : null,
         count: 0,
         qty: 0,
         storeD: 0,
@@ -766,8 +808,12 @@ function App() {
         const isRateCol = key === 'rate' || key.endsWith('Rate');
         const isTextCol = key === 'name' || key === 'wc' || key === 'material' || key === 'matCode';
         const isDateCol = key === 'date';
+        const isTimeCol = key === 'startTime' || key === 'endTime';
+        const isRunTimeCol = key === 'runTime';
         let val;
         if (isDateCol) val = keyToLabel(r[key]);
+        else if (isTimeCol) val = formatDateTime(r[key]);
+        else if (isRunTimeCol) val = r[key] != null ? r[key].toFixed(1) : '-';
         else if (isRateCol) val = r[key].toFixed(2);
         else if (isTextCol) val = r[key] || '';
         else val = Math.round(r[key]);
@@ -815,6 +861,11 @@ function App() {
     ...(view === 'alloy' ? [['wc', 'Machine', 'left']] : []),
     ...(view === 'wc' ? [['count', 'Batch', 'right']] : []),
     ['qty', 'Qty (kg)', 'right'],
+    ...(view === 'batch' ? [
+      ['startTime', 'Start Time', 'left'],
+      ['endTime', 'End Time', 'left'],
+      ['runTime', 'Run Time (min)', 'right']
+    ] : []),
     ['storeDRate', 'Store direct (Rs/kg)', 'right'],
     ['storeIRate', 'Store indirect (Rs/kg)', 'right'],
     ['labDRate', 'Labour direct (Rs/kg)', 'right'],
@@ -1554,8 +1605,12 @@ function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort, o
                 const isRateCol = key === 'rate' || key.endsWith('Rate');
                 const isTextCol = key === 'name' || key === 'wc' || key === 'material' || key === 'matCode';
                 const isDateCol = key === 'date';
+                const isTimeCol = key === 'startTime' || key === 'endTime';
+                const isRunTimeCol = key === 'runTime';
                 let val;
                 if (isDateCol) val = keyToLabel(r[key]);
+                else if (isTimeCol) val = formatDateTime(r[key]);
+                else if (isRunTimeCol) val = r[key] != null ? r[key].toFixed(1) : '-';
                 else if (isRateCol) val = fmtRate(r[key]);
                 else if (isTextCol) val = r[key] || '-';
                 else val = fmt(r[key]);
