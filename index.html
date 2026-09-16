@@ -104,6 +104,14 @@ const GROUP_MAP = {
 };
 const DEPARTMENTS = ['CCP / Mill', 'Coin', 'Coil', 'Cup', 'Case'];
 
+// the three combined (Direct + Indirect) cost categories that get their own
+// trend chart in every view, in addition to the overall Total trend/chart
+const METRIC_CONFIGS = [
+  { key: 'store', label: 'Store', fields: ['storeD', 'storeI'], batchKey: 'storeTotalRate' },
+  { key: 'labour', label: 'Labour', fields: ['labD', 'labI'], batchKey: 'labTotalRate' },
+  { key: 'power', label: 'Power', fields: ['powerD', 'powerI'], batchKey: 'powerTotalRate' }
+];
+
 /* ============================================================
    STORAGE (Google Sheet backend, in-memory cache)
    Batch data is stored as real sheet rows (not one giant JSON
@@ -420,7 +428,11 @@ function aggregateBy(rows, keyFn, nameFn) {
       labDRate: b.qty ? b.labD / b.qty : 0,
       labIRate: b.qty ? b.labI / b.qty : 0,
       powerDRate: b.qty ? b.powerD / b.qty : 0,
-      powerIRate: b.qty ? b.powerI / b.qty : 0
+      powerIRate: b.qty ? b.powerI / b.qty : 0,
+      // combined Direct + Indirect, one column each for Store/Labour/Power
+      storeTotalRate: b.qty ? (b.storeD + b.storeI) / b.qty : 0,
+      labTotalRate: b.qty ? (b.labD + b.labI) / b.qty : 0,
+      powerTotalRate: b.qty ? (b.powerD + b.powerI) / b.qty : 0
     }))
     .sort((a, b) => b.qty - a.qty);
 }
@@ -809,6 +821,9 @@ function App() {
     ['labIRate', 'Labour indirect (Rs/kg)', 'right'],
     ['powerDRate', 'Power direct (Rs/kg)', 'right'],
     ['powerIRate', 'Power indirect (Rs/kg)', 'right'],
+    ['storeTotalRate', 'Total Store (Rs/kg)', 'right'],
+    ['labTotalRate', 'Total Labour (Rs/kg)', 'right'],
+    ['powerTotalRate', 'Total Power (Rs/kg)', 'right'],
     ['rate', 'Total (Rs/kg)', 'right']
   ];
 
@@ -866,6 +881,21 @@ function App() {
           </div>
         )}
 
+        {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && METRIC_CONFIGS.map(m => (
+          <div key={m.key} style={{
+            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+            padding: '16px 16px 8px', marginBottom: 16
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>{m.label} cost per kg over time — by alloy</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — top 10 alloys by volume)</span>
+            </div>
+            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeAlloyOptions}
+              groupField="mat" fromDate={fromDate} toDate={toDate} metricFields={m.fields}
+              ariaLabel={m.label + ' cost per kg over time, one line per alloy.'} />
+          </div>
+        ))}
+
         {!loading && !error && view === 'wc' && allTimeMachineOptions.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
@@ -881,6 +911,21 @@ function App() {
           </div>
         )}
 
+        {!loading && !error && view === 'wc' && allTimeMachineOptions.length > 0 && METRIC_CONFIGS.map(m => (
+          <div key={m.key} style={{
+            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+            padding: '16px 16px 8px', marginBottom: 16
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>{m.label} cost per kg over time — by machine</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all alloys combined per machine, {department} — top 10 machines by volume)</span>
+            </div>
+            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeMachineOptions}
+              groupField="wc" fromDate={fromDate} toDate={toDate} metricFields={m.fields}
+              ariaLabel={m.label + ' cost per kg over time, one line per machine.'} />
+          </div>
+        ))}
+
         {!loading && !error && view === 'batch' && sortedFiltered.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
@@ -893,6 +938,20 @@ function App() {
             <BatchRateBarChart rows={sortedFiltered} />
           </div>
         )}
+
+        {!loading && !error && view === 'batch' && sortedFiltered.length > 0 && METRIC_CONFIGS.map(m => (
+          <div key={m.key} style={{
+            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+            padding: '16px 16px 8px', marginBottom: 16
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>{m.label} cost per kg by batch</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>({department}, this selection — top 25 shown, hover a bar for qty)</span>
+            </div>
+            <BatchRateBarChart rows={sortedFiltered} metricKey={m.batchKey}
+              ariaLabel={m.label + ' cost per kg, one bar per batch.'} />
+          </div>
+        ))}
 
         <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, overflow: 'hidden' }}>
           {loading ? (
@@ -1237,8 +1296,9 @@ function MultiValueCell({ value }) {
 ============================================================ */
 const TREND_LINE_COLORS = ['#B54E2E', '#2E6FBF', '#1E9E6B', '#D9A400', '#C0568A', '#6B4FBF', '#2AA198', '#C4453A', '#7A8B3F', '#8B5A2B'];
 
-function buildAlloyTrendData(allRows, department, groupValues, groupField, fromDate, toDate) {
+function buildAlloyTrendData(allRows, department, groupValues, groupField, fromDate, toDate, metricFields) {
   groupField = groupField || 'mat';
+  metricFields = metricFields || ['total'];
   if (!allRows || !groupValues.length) return { dates: [], rateDatasets: [], qtyDatasets: [], totalQtyByDate: {} };
   const canonicalByNormKey = {};
   groupValues.forEach(v => { canonicalByNormKey[normKey(v)] = v; });
@@ -1256,7 +1316,7 @@ function buildAlloyTrendData(allRows, department, groupValues, groupField, fromD
     const key = canonical + '||' + r.date;
     if (!byGroupDate[key]) byGroupDate[key] = { qty: 0, total: 0 };
     byGroupDate[key].qty += r.qty;
-    byGroupDate[key].total += r.total;
+    byGroupDate[key].total += metricFields.reduce((sum, f) => sum + (r[f] || 0), 0);
   });
   const dates = Array.from(dateSet).sort();
   const rateDatasets = groupValues.map((val, i) => ({
@@ -1286,13 +1346,13 @@ function buildAlloyTrendData(allRows, department, groupValues, groupField, fromD
   return { dates, rateDatasets, qtyDatasets, totalQtyByDate };
 }
 
-function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, toDate, ariaLabel }) {
+function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, toDate, ariaLabel, metricFields, yAxisLabel }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
 
   const { dates, rateDatasets, totalQtyByDate } = useMemo(
-    () => buildAlloyTrendData(allRows, department, alloys, groupField, fromDate, toDate),
-    [allRows, department, alloys, groupField, fromDate, toDate]
+    () => buildAlloyTrendData(allRows, department, alloys, groupField, fromDate, toDate, metricFields),
+    [allRows, department, alloys, groupField, fromDate, toDate, metricFields]
   );
 
   useEffect(() => {
@@ -1324,7 +1384,7 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
         },
         scales: {
           x: { ticks: { autoSkip: false, maxRotation: 45 }, grid: { display: false } },
-          y: { title: { display: true, text: 'Rs / kg' }, grid: { color: '#E7E2D8' }, beginAtZero: true }
+          y: { title: { display: true, text: yAxisLabel || 'Rs / kg' }, grid: { color: '#E7E2D8' }, beginAtZero: true }
         }
       }
     });
@@ -1353,9 +1413,10 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
    BATCH RATE BAR CHART (vertical bar: Batch on X axis,
    Rs/kg on Y axis, for the current selection)
 ============================================================ */
-function BatchRateBarChart({ rows }) {
+function BatchRateBarChart({ rows, metricKey, yAxisLabel, ariaLabel }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
+  const key = metricKey || 'rate';
   // cap so the chart stays readable — the table below already shows every row
   const capped = useMemo(() => rows.slice(0, 25), [rows]);
 
@@ -1367,7 +1428,7 @@ function BatchRateBarChart({ rows }) {
       data: {
         labels: capped.map(r => r.name),
         datasets: [{
-          data: capped.map(r => r.rate),
+          data: capped.map(r => r[key]),
           backgroundColor: '#B54E2E',
           borderRadius: 4,
           barThickness: 20
@@ -1388,12 +1449,12 @@ function BatchRateBarChart({ rows }) {
         },
         scales: {
           x: { grid: { display: false }, ticks: { font: { size: 11 }, maxRotation: 45, autoSkip: false } },
-          y: { title: { display: true, text: 'Rs / kg' }, beginAtZero: true, grid: { color: '#E7E2D8' } }
+          y: { title: { display: true, text: yAxisLabel || 'Rs / kg' }, beginAtZero: true, grid: { color: '#E7E2D8' } }
         }
       }
     });
     return () => { if (chartRef.current) chartRef.current.destroy(); };
-  }, [capped]);
+  }, [capped, key]);
 
   if (!capped.length) {
     return <div style={{ fontSize: 13, color: 'var(--ink-2)', padding: '12px 0' }}>No batch data yet.</div>;
@@ -1401,7 +1462,7 @@ function BatchRateBarChart({ rows }) {
 
   return (
     <div style={{ position: 'relative', height: 320 }}>
-      <canvas ref={canvasRef} role="img" aria-label="Bar chart of Rs per kg cost, one bar per batch. Batch numbers on the X axis, Rs per kg on the Y axis."></canvas>
+      <canvas ref={canvasRef} role="img" aria-label={ariaLabel || "Bar chart of Rs per kg cost, one bar per batch. Batch numbers on the X axis, Rs per kg on the Y axis."}></canvas>
     </div>
   );
 }
