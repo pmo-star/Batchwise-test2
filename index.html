@@ -1153,7 +1153,7 @@ function FilterBar({ dateIndex, fromDate, setFromDate, toDate, setToDate, depart
         </select>
       )}
 
-      {batchOptions && batchOptions.length > 0 && (
+      {view === 'batch' && batchOptions && batchOptions.length > 0 && (
         <select
           value={selectedBatch}
           onChange={e => {
