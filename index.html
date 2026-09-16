@@ -268,6 +268,18 @@ function formatDateTime(ms) {
   return pad(d.getUTCDate()) + ' ' + months[d.getUTCMonth()] + ' ' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds());
 }
 
+// Converts numeric runtime in minutes into HH:MM:SS for display/export.
+// The backend continues to store runTime as numeric minutes, so calculations and sorting remain unchanged.
+function formatRunTime(minutes) {
+  if (minutes == null || !isFinite(Number(minutes))) return '-';
+  const totalSeconds = Math.max(0, Math.round(Number(minutes) * 60));
+  const hours = Math.floor(totalSeconds / 3600);
+  const mins = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return pad(hours) + ':' + pad(mins) + ':' + pad(secs);
+}
+
 function normKey(s) {
   return (s || '').trim().replace(/\s+/g, ' ').toUpperCase();
 }
@@ -813,7 +825,7 @@ function App() {
         let val;
         if (isDateCol) val = keyToLabel(r[key]);
         else if (isTimeCol) val = formatDateTime(r[key]);
-        else if (isRunTimeCol) val = r[key] != null ? r[key].toFixed(1) : '-';
+        else if (isRunTimeCol) val = formatRunTime(r[key]);
         else if (isRateCol) val = r[key].toFixed(2);
         else if (isTextCol) val = r[key] || '';
         else val = Math.round(r[key]);
@@ -864,7 +876,7 @@ function App() {
     ...(view === 'batch' ? [
       ['startTime', 'Start Time', 'left'],
       ['endTime', 'End Time', 'left'],
-      ['runTime', 'Run Time (min)', 'right']
+      ['runTime', 'Run Time (HH:MM:SS)', 'right']
     ] : []),
     ['storeDRate', 'Store direct (Rs/kg)', 'right'],
     ['storeIRate', 'Store indirect (Rs/kg)', 'right'],
@@ -1610,7 +1622,7 @@ function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort, o
                 let val;
                 if (isDateCol) val = keyToLabel(r[key]);
                 else if (isTimeCol) val = formatDateTime(r[key]);
-                else if (isRunTimeCol) val = r[key] != null ? r[key].toFixed(1) : '-';
+                else if (isRunTimeCol) val = formatRunTime(r[key]);
                 else if (isRateCol) val = fmtRate(r[key]);
                 else if (isTextCol) val = r[key] || '-';
                 else val = fmt(r[key]);
