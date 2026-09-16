@@ -108,8 +108,8 @@ const DEPARTMENTS = ['CCP / Mill', 'Coin', 'Coil', 'Cup', 'Case'];
 // trend chart in every view, in addition to the overall Total trend/chart
 const METRIC_CONFIGS = [
   { key: 'store', label: 'Store', fields: ['storeD', 'storeI'], batchKey: 'storeTotalRate' },
-  { key: 'labour', label: 'Labour', fields: ['labD', 'labI'], batchKey: 'labTotalRate' },
-  { key: 'power', label: 'Power', fields: ['powerD', 'powerI'], batchKey: 'powerTotalRate' }
+  { key: 'power', label: 'Power', fields: ['powerD', 'powerI'], batchKey: 'powerTotalRate' },
+  { key: 'labour', label: 'Labour', fields: ['labD', 'labI'], batchKey: 'labTotalRate' }
 ];
 
 /* ============================================================
@@ -866,28 +866,13 @@ function App() {
           <StatRow qty={totals.qty} total={totals.total} entries={totals.count} fmt={fmt} />
         )}
 
-        {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && (
-          <div style={{
-            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
-            padding: '16px 16px 8px', marginBottom: 16
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg over time — by alloy</span>
-              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — top 10 alloys by volume — hover a point for qty too)</span>
-            </div>
-            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeAlloyOptions}
-              groupField="mat" fromDate={fromDate} toDate={toDate}
-              ariaLabel="Line chart of Rs per kg cost over time, one line per alloy. Hover a point to see quantity." />
-          </div>
-        )}
-
         {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && METRIC_CONFIGS.map(m => (
           <div key={m.key} style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
             padding: '16px 16px 8px', marginBottom: 16
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>{m.label} cost per kg over time — by alloy</span>
+              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>{m.label} cost per kg over time — by alloy</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — top 10 alloys by volume)</span>
             </div>
             <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeAlloyOptions}
@@ -896,18 +881,18 @@ function App() {
           </div>
         ))}
 
-        {!loading && !error && view === 'wc' && allTimeMachineOptions.length > 0 && (
+        {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
             padding: '16px 16px 8px', marginBottom: 16
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg over time — by machine</span>
-              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all alloys combined per machine, {department} — top 10 machines by volume — hover a point for qty too)</span>
+              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>Total cost per kg over time — by alloy</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — top 10 alloys by volume — hover a point for qty too)</span>
             </div>
-            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeMachineOptions}
-              groupField="wc" fromDate={fromDate} toDate={toDate}
-              ariaLabel="Line chart of Rs per kg cost over time, one line per machine. Hover a point to see quantity." />
+            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeAlloyOptions}
+              groupField="mat" fromDate={fromDate} toDate={toDate}
+              ariaLabel="Line chart of Rs per kg cost over time, one line per alloy. Hover a point to see quantity." />
           </div>
         )}
 
@@ -917,7 +902,7 @@ function App() {
             padding: '16px 16px 8px', marginBottom: 16
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>{m.label} cost per kg over time — by machine</span>
+              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>{m.label} cost per kg over time — by machine</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all alloys combined per machine, {department} — top 10 machines by volume)</span>
             </div>
             <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeMachineOptions}
@@ -926,16 +911,18 @@ function App() {
           </div>
         ))}
 
-        {!loading && !error && view === 'batch' && sortedFiltered.length > 0 && (
+        {!loading && !error && view === 'wc' && allTimeMachineOptions.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
             padding: '16px 16px 8px', marginBottom: 16
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg by batch</span>
-              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>({department}, this selection — top 25 shown, hover a bar for qty)</span>
+              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>Total cost per kg over time — by machine</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all alloys combined per machine, {department} — top 10 machines by volume — hover a point for qty too)</span>
             </div>
-            <BatchRateBarChart rows={sortedFiltered} />
+            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeMachineOptions}
+              groupField="wc" fromDate={fromDate} toDate={toDate}
+              ariaLabel="Line chart of Rs per kg cost over time, one line per machine. Hover a point to see quantity." />
           </div>
         )}
 
@@ -945,13 +932,26 @@ function App() {
             padding: '16px 16px 8px', marginBottom: 16
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>{m.label} cost per kg by batch</span>
+              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>{m.label} cost per kg by batch</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>({department}, this selection — top 25 shown, hover a bar for qty)</span>
             </div>
             <BatchRateBarChart rows={sortedFiltered} metricKey={m.batchKey}
               ariaLabel={m.label + ' cost per kg, one bar per batch.'} />
           </div>
         ))}
+
+        {!loading && !error && view === 'batch' && sortedFiltered.length > 0 && (
+          <div style={{
+            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+            padding: '16px 16px 8px', marginBottom: 16
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>Total cost per kg by batch</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>({department}, this selection — top 25 shown, hover a bar for qty)</span>
+            </div>
+            <BatchRateBarChart rows={sortedFiltered} />
+          </div>
+        )}
 
         <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, overflow: 'hidden' }}>
           {loading ? (
