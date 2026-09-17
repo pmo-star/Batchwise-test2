@@ -99,10 +99,10 @@ if (typeof pdfjsLib !== 'undefined') {
 const GOOGLE_SHEET_API_URL = 'https://script.google.com/macros/s/AKfycbzkfY8LRSrbi7gsWXYjXYnu_h5C31uPJibO2Nm7sDuNtF493GhTuI8JAj4uAVL5gUvh/exec';
 
 const GROUP_MAP = {
-  ZCCP: 'CCP / Mill', ZMILL: 'CCP / Mill', ZPULV: 'CCP / Mill', ZCH01: 'CCP / Mill',
+  ZCCP: 'CCP', ZMILL: 'CCP', ZPULV: 'CCP', ZCH01: 'CCP',
   ZCOIN: 'Coin', ZCL01: 'Coil', ZCUP: 'Cup', ZCASE: 'Case'
 };
-const DEPARTMENTS = ['CCP / Mill', 'Coin', 'Coil', 'Cup', 'Case'];
+const DEPARTMENTS = ['CCP', 'Coin', 'Coil', 'Cup', 'Case'];
 
 const METRIC_CONFIGS = [
   { key: 'store', label: 'Store', fields: ['storeD', 'storeI'], batchKey: 'storeTotalRate' },
@@ -509,7 +509,7 @@ function App() {
   const [allRows, setAllRows] = useState(null);
   const [fromDate, setFromDate] = useState(null);
   const [toDate, setToDate] = useState(null);
-  const [department, setDepartment] = useState('CCP / Mill');
+  const [department, setDepartment] = useState('CCP');
   const [view, setView] = useState('wc');
   const [sortKey, setSortKey] = useState(null);
   const [sortDir, setSortDir] = useState('desc');
