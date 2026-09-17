@@ -780,6 +780,17 @@ function App() {
     else { setSortKey(key); setSortDir('desc'); }
   }
 
+  // clicking a row's name should reuse the SAME filter the dropdowns use,
+  // not a separate free-text search — otherwise "Machine: X" (from the
+  // dropdown) and "Search: X" (from clicking the same machine's name in
+  // the table) show up as two redundant chips for one filter, and clearing
+  // one leaves the other still narrowing the data.
+  function handleNameClick(name) {
+    if (view === 'wc') setSelectedMachine(name);
+    else if (view === 'batch') setSelectedBatch(name);
+    else setSearch(name);
+  }
+
   function handleExportCsv() {
     if (!sortedFiltered.length) return;
     const headers = COLS_AGG.map(([, label]) => label);
@@ -1006,7 +1017,7 @@ function App() {
             />
           ) : (
             <DataTable cols={COLS_AGG} rows={sortedFiltered} fmt={fmt} fmtRate={fmtRate} view={view}
-              sortKey={sortKey} sortDir={sortDir} onSort={handleSort} onNameClick={setSearch} />
+              sortKey={sortKey} sortDir={sortDir} onSort={handleSort} onNameClick={handleNameClick} />
           )}
         </div>
       </main>
