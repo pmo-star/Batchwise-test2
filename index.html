@@ -565,12 +565,19 @@ function parseCsvText(text) {
 }
 
 async function fetchPlanSheetCsv(sheetId, sheetName) {
-  const url = 'https://docs.google.com/spreadsheets/d/' + sheetId +
-    '/gviz/tq?tqx=out:csv&sheet=' + encodeURIComponent(sheetName);
+  // Goes through our own Apps Script backend (same account that already
+  // manages the batch-tracking Sheet) instead of Google's public gviz CSV
+  // export — this way the plan sheet never needs "anyone with the link"
+  // sharing, only normal sharing with whichever account the script runs as.
+  const url = GOOGLE_SHEET_API_URL + '?action=getPlanRows' +
+    '&sheetId=' + encodeURIComponent(sheetId) + '&tabName=' + encodeURIComponent(sheetName);
   const res = await fetch(url);
-  if (!res.ok) throw new Error('Could not reach the plan sheet (HTTP ' + res.status + ').');
-  const text = await res.text();
-  return parseCsvText(text);
+  if (!res.ok) throw new Error('Could not reach the backend (HTTP ' + res.status + ').');
+  const json = await res.json();
+  if (!json || json.success === false) {
+    throw new Error((json && json.error) || 'The backend could not read that plan sheet/tab.');
+  }
+  return json.rows || [];
 }
 
 // finds the "catch-up" summary table anywhere in the sheet by matching
