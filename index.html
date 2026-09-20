@@ -110,6 +110,20 @@ const METRIC_CONFIGS = [
   { key: 'labour', label: 'Labour', fields: ['labD', 'labI'], batchKey: 'labTotalRate' }
 ];
 
+/* ============================================================
+   PLAN vs ACTUAL (live Google Sheet)
+   The planning sheet's tabs are named per month, e.g.
+   "CCP Plan vs Actual Sep" — when the month rolls over, update
+   PLAN_MONTH_SUFFIX below (nothing else needs to change).
+============================================================ */
+const PLAN_SHEET_ID = '1npeP0RAHDB-L0ivQwT2hxo4NJMygS7jylWIX5wTmVtk';
+const PLAN_MONTH_SUFFIX = 'Sep';
+const PLAN_TABS = [
+  { key: 'ccp', label: 'CCP Plan', sheetName: 'CCP Plan vs Actual ' + PLAN_MONTH_SUFFIX },
+  { key: 'coil', label: 'Coil Transfer Plan', sheetName: 'Coil Transfer Plan vs Actual ' + PLAN_MONTH_SUFFIX },
+  { key: 'fg', label: 'FG Packing', sheetName: 'FG Packing Plan vs Actual ' + PLAN_MONTH_SUFFIX }
+];
+
 const cache = {};
 async function sheetGetMeta(key) {
   const cacheKey = 'meta:' + key;
@@ -282,6 +296,7 @@ async function extractRowsFromPdf(arrayBuffer) {
 
   const dataRows = [];
   let headerRow = null;
+  let headerX = null; // x-position of each header cell — used as column boundaries
 
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
@@ -297,13 +312,38 @@ async function extractRowsFromPdf(arrayBuffer) {
 
     const sortedYs = Object.keys(rowMap).map(Number).sort((a, b) => b - a);
     sortedYs.forEach(y => {
-      const cells = rowMap[y].sort((a, b) => a.x - b.x).map(c => c.str);
-      if (cells.length < 10) return;
-      if (cells[0] === 'Company Code') {
-        if (!headerRow) headerRow = cells;
+      const items = rowMap[y].sort((a, b) => a.x - b.x);
+      if (items.length < 10) return;
+
+      if (items[0].str === 'Company Code') {
+        if (!headerRow) {
+          headerRow = items.map(it => it.str);
+          headerX = items.map(it => it.x);
+        }
         return;
       }
-      dataRows.push(cells);
+
+      if (headerX) {
+        // Some SAP exports leave a cell blank (e.g. Batch Confirm Qty for a
+        // DROSS/recovery batch) — pdf.js then emits no text item at all for
+        // that position. Reading data rows by plain left-to-right token
+        // order would silently shift every later column back by one for
+        // that row. Bucketing each token by which header column's x-range
+        // it actually falls into keeps a blank cell blank instead, so every
+        // later value — Start/End Time included — lands in the right place.
+        const buckets = headerX.map(() => []);
+        items.forEach(it => {
+          let col = 0;
+          for (let i = 0; i < headerX.length; i++) {
+            if (headerX[i] <= it.x + 3) col = i;
+          }
+          buckets[col].push(it.str);
+        });
+        dataRows.push(buckets.map(b => b.join(' ').trim()));
+      } else {
+        // header not captured yet on this page — fall back to plain order
+        dataRows.push(items.map(it => it.str));
+      }
     });
   }
 
@@ -469,6 +509,120 @@ function aggregateBy(rows, keyFn, nameFn) {
     .sort((a, b) => b.qty - a.qty);
 }
 
+/* ============================================================
+   PLAN vs ACTUAL — fetch + parse
+   Fetched as CSV via Google's gviz endpoint (no API key needed;
+   the sheet just needs to be viewable by anyone with the link).
+   Parsing is done by matching HEADER TEXT, not fixed column
+   positions — the planning sheet's exact column layout can shift
+   without breaking this, the same way the SAP file parser looks
+   up columns by name instead of position.
+============================================================ */
+function parseCsvText(text) {
+  // minimal CSV parser: handles quoted fields, escaped quotes, commas/newlines inside quotes
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      row.push(field); field = '';
+    } else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      rows.push(row); row = [];
+    } else {
+      field += c;
+    }
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+async function fetchPlanSheetCsv(sheetName) {
+  const url = 'https://docs.google.com/spreadsheets/d/' + PLAN_SHEET_ID +
+    '/gviz/tq?tqx=out:csv&sheet=' + encodeURIComponent(sheetName);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Could not reach the plan sheet (HTTP ' + res.status + ').');
+  const text = await res.text();
+  return parseCsvText(text);
+}
+
+// finds the "catch-up" summary table anywhere in the sheet by matching
+// header text (Product / Plan / Actual-or-Transferred / Shortfall /
+// Required-per-day) rather than a fixed row/column position
+function findCatchupHeaderRow(rows) {
+  for (let r = 0; r < rows.length; r++) {
+    const cells = rows[r].map(c => (c || '').toString().trim().toLowerCase());
+    const hasProduct = cells.some(c => c === 'product');
+    const hasPlan = cells.some(c => c.includes('plan'));
+    const hasActual = cells.some(c => c.includes('actual') || c.includes('transfer'));
+    const hasShortfall = cells.some(c => c.includes('shortfall'));
+    if (hasProduct && hasPlan && hasActual && hasShortfall) return r;
+  }
+  return -1;
+}
+
+function colIndexMatching(headerCells, predicate) {
+  for (let i = 0; i < headerCells.length; i++) {
+    if (predicate(headerCells[i])) return i;
+  }
+  return -1;
+}
+
+function parseNum(v) {
+  if (v == null || v === '') return null;
+  const n = parseFloat(String(v).replace(/,/g, ''));
+  return isFinite(n) ? n : null;
+}
+
+function parsePlanCatchup(rows) {
+  const headerIdx = findCatchupHeaderRow(rows);
+  if (headerIdx === -1) return { rows: [], total: null };
+
+  const header = rows[headerIdx].map(c => (c || '').toString().trim().toLowerCase());
+  const cProduct = colIndexMatching(header, c => c === 'product');
+  const cTotalPlan = colIndexMatching(header, c => c.includes('total') && c.includes('plan'));
+  const cPlanTillDate = colIndexMatching(header, c => c.includes('plan') && c.includes('till'));
+  const cActualTillDate = colIndexMatching(header, c => (c.includes('transfer') || c.includes('actual')) && c.includes('till'));
+  const cShortfallTillDate = colIndexMatching(header, c => c.includes('shortfall') && c.includes('till'));
+  const cTotalShortfall = colIndexMatching(header, c => c.includes('total') && c.includes('shortfall'));
+  const cRequiredPerDay = colIndexMatching(header, c => c.includes('required'));
+
+  if (cProduct === -1) return { rows: [], total: null };
+
+  const out = [];
+  let total = null;
+  for (let r = headerIdx + 1; r < rows.length; r++) {
+    const row = rows[r];
+    const name = (row[cProduct] || '').toString().trim();
+    if (!name) break; // blank row ends the table
+    const entry = {
+      name,
+      totalPlan: parseNum(row[cTotalPlan]),
+      planTillDate: parseNum(row[cPlanTillDate]),
+      actualTillDate: parseNum(row[cActualTillDate]),
+      shortfallTillDate: parseNum(row[cShortfallTillDate]),
+      totalShortfall: parseNum(row[cTotalShortfall]),
+      requiredPerDay: parseNum(row[cRequiredPerDay])
+    };
+    if (name.toLowerCase() === 'total' || name.toLowerCase() === 'g.total') {
+      total = entry;
+    } else {
+      out.push(entry);
+    }
+  }
+  return { rows: out, total };
+}
+
 function IconSearch() {
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>;
 }
@@ -486,6 +640,9 @@ function IconMoon() {
 }
 function IconSun() {
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>;
+}
+function IconPlan() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>;
 }
 
 function Chip({ label, onRemove }) {
@@ -516,6 +673,11 @@ function App() {
   const [search, setSearch] = useState('');
   const [selectedMachine, setSelectedMachine] = useState('');
   const [selectedBatch, setSelectedBatch] = useState('');
+  const [showPlanModal, setShowPlanModal] = useState(false);
+  const [planTabKey, setPlanTabKey] = useState('ccp');
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planError, setPlanError] = useState(null);
+  const [planData, setPlanData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [uploading, setUploading] = useState(false);
@@ -553,6 +715,28 @@ function App() {
   }, []);
 
   useEffect(() => { loadAll(); }, [loadAll]);
+
+  useEffect(() => {
+    if (!showPlanModal) return;
+    const tab = PLAN_TABS.find(t => t.key === planTabKey);
+    if (!tab) return;
+    let cancelled = false;
+    setPlanLoading(true); setPlanError(null);
+    fetchPlanSheetCsv(tab.sheetName)
+      .then(rows => {
+        if (cancelled) return;
+        const parsed = parsePlanCatchup(rows);
+        if (!parsed.rows.length) {
+          setPlanError('Could not find a Plan/Actual/Shortfall table on the "' + tab.sheetName + '" tab.');
+          setPlanData(null);
+        } else {
+          setPlanData(parsed);
+        }
+      })
+      .catch(e => { if (!cancelled) { setPlanError(e.message || 'Could not load the plan sheet.'); setPlanData(null); } })
+      .finally(() => { if (!cancelled) setPlanLoading(false); });
+    return () => { cancelled = true; };
+  }, [showPlanModal, planTabKey]);
 
   const rows = useMemo(() => {
     if (!allRows || !fromDate || !toDate) return allRows === null ? null : [];
@@ -880,6 +1064,7 @@ function App() {
         canExport={!!(rows && rows.length)}
         uploading={uploading}
         uploadProgress={uploadProgress}
+        onOpenPlan={() => setShowPlanModal(true)}
       />
       <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.pdf" multiple style={{ display: 'none' }}
         onChange={e => { if (e.target.files.length) handleFiles(e.target.files); e.target.value = ''; }} />
@@ -1030,11 +1215,19 @@ function App() {
           {toast.msg}
         </div>
       )}
+
+      {showPlanModal && (
+        <PlanModal
+          onClose={() => setShowPlanModal(false)}
+          planTabKey={planTabKey} setPlanTabKey={setPlanTabKey}
+          loading={planLoading} error={planError} data={planData}
+        />
+      )}
     </div>
   );
 }
 
-function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, canExport, uploading, uploadProgress }) {
+function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, canExport, uploading, uploadProgress, onOpenPlan }) {
   return (
     <header style={{ borderBottom: '1px solid var(--line)', background: 'var(--surface)', position: 'sticky', top: 0, zIndex: 10 }}>
       <div className="topbar-row" style={{ maxWidth: 1650, margin: '0 auto', padding: '14px 24px', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
@@ -1059,6 +1252,14 @@ function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, c
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto', flexShrink: 0 }}>
+          <button onClick={onOpenPlan} className="focus-ring topbar-btn" style={{
+            display: 'flex', alignItems: 'center', gap: 7, padding: '9px 16px', borderRadius: 8,
+            border: '1px solid var(--accent)', background: 'var(--accent-soft)', color: 'var(--accent)', fontWeight: 700, fontSize: 13
+          }} title="Plan vs Actual — CCP / Coil Transfer / FG Packing">
+            <IconPlan />
+            <span className="btn-label">Plan vs Actual</span>
+          </button>
+
           <button onClick={onExport} disabled={!canExport} className="focus-ring topbar-btn" style={{
             display: 'flex', alignItems: 'center', gap: 7, padding: '9px 14px', borderRadius: 8,
             border: '1px solid var(--line-strong)', background: 'var(--surface)', fontWeight: 600, fontSize: 13,
@@ -1280,6 +1481,148 @@ function StatRow({ qty, total, entries, fmt }) {
           <div style={{ fontSize: 21, fontWeight: 600, marginTop: 2 }}>{val}</div>
         </div>
       ))}
+    </div>
+  );
+}
+
+/* ============================================================
+   PLAN vs ACTUAL MODAL
+============================================================ */
+function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data }) {
+  const fmt = n => n == null ? '-' : Math.round(n).toLocaleString('en-IN');
+
+  // biggest shortfall first — the rows that need the most catching up
+  const sortedRows = useMemo(() => {
+    if (!data || !data.rows) return [];
+    return [...data.rows].sort((a, b) => (a.requiredPerDay ?? 0) - (b.requiredPerDay ?? 0));
+  }, [data]);
+
+  const achievement = data && data.total && data.total.planTillDate
+    ? Math.round((data.total.actualTillDate / data.total.planTillDate) * 100)
+    : null;
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, background: 'rgba(28,27,25,0.5)', zIndex: 100,
+      display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '32px 20px', overflowY: 'auto'
+    }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: 'var(--bg)', borderRadius: 14, width: '100%', maxWidth: 1100,
+        maxHeight: '92vh', overflowY: 'auto', boxShadow: '0 20px 60px rgba(0,0,0,0.25)'
+      }}>
+        <div style={{
+          position: 'sticky', top: 0, background: 'var(--surface)', borderBottom: '1px solid var(--line)',
+          padding: '16px 24px', display: 'flex', alignItems: 'center', gap: 12, zIndex: 2
+        }}>
+          <span style={{ fontSize: 16, fontWeight: 700 }}>Plan vs Actual</span>
+          <button onClick={onClose} className="focus-ring" aria-label="Close"
+            style={{ marginLeft: 'auto', background: 'none', border: 'none', display: 'flex', padding: 6, borderRadius: 8, color: 'var(--ink-2)' }}>
+            <IconX />
+          </button>
+        </div>
+
+        <div style={{ padding: '20px 24px 28px' }}>
+          <div style={{ display: 'flex', gap: 4, background: 'var(--surface-2)', border: '1px solid var(--line)', borderRadius: 8, padding: 3, width: 'fit-content', marginBottom: 18 }}>
+            {PLAN_TABS.map(t => (
+              <button key={t.key} onClick={() => setPlanTabKey(t.key)} className="focus-ring" style={{
+                padding: '7px 16px', borderRadius: 6, border: 'none', fontSize: 13, fontWeight: 700,
+                background: t.key === planTabKey ? 'var(--surface)' : 'transparent',
+                color: t.key === planTabKey ? 'var(--ink)' : 'var(--ink-2)', cursor: 'pointer',
+                boxShadow: t.key === planTabKey ? '0 1px 2px rgba(0,0,0,0.06)' : 'none'
+              }}>{t.label}</button>
+            ))}
+          </div>
+
+          {loading && (
+            <div style={{ padding: '48px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, color: 'var(--ink-2)' }}>
+              <span className="spin" style={{ width: 20, height: 20, border: '2.5px solid var(--line-strong)', borderTopColor: 'var(--accent)', borderRadius: '50%', display: 'inline-block' }} />
+              <span style={{ fontSize: 13 }}>Loading plan data…</span>
+            </div>
+          )}
+
+          {!loading && error && (
+            <div style={{ padding: '32px 20px', textAlign: 'center' }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>Could not load this plan</div>
+              <div style={{ fontSize: 13, color: 'var(--ink-2)' }}>{error}</div>
+            </div>
+          )}
+
+          {!loading && !error && data && (
+            <React.Fragment>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, marginBottom: 18 }}>
+                <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 16px' }}>
+                  <div style={{ fontSize: 12, color: 'var(--ink-2)' }}>Total Plan</div>
+                  <div style={{ fontSize: 22, fontWeight: 600, marginTop: 2 }}>{fmt(data.total && data.total.totalPlan)}</div>
+                </div>
+                <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 16px' }}>
+                  <div style={{ fontSize: 12, color: 'var(--ink-2)' }}>Total Actual</div>
+                  <div style={{ fontSize: 22, fontWeight: 600, marginTop: 2 }}>{fmt(data.total && data.total.actualTillDate)}</div>
+                </div>
+                <div style={{ background: 'var(--danger-soft)', border: '1px solid var(--danger)', borderRadius: 10, padding: '14px 16px' }}>
+                  <div style={{ fontSize: 12, color: 'var(--danger)' }}>Total Shortfall</div>
+                  <div style={{ fontSize: 22, fontWeight: 700, marginTop: 2, color: 'var(--danger)' }}>{fmt(data.total && data.total.totalShortfall)}</div>
+                </div>
+                <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 16px' }}>
+                  <div style={{ fontSize: 12, color: 'var(--ink-2)' }}>Achievement</div>
+                  <div style={{ fontSize: 22, fontWeight: 600, marginTop: 2 }}>{achievement != null ? achievement + '%' : '-'}</div>
+                </div>
+              </div>
+
+              <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, overflow: 'hidden' }}>
+                <div style={{ padding: '14px 20px 2px', fontSize: 13, color: 'var(--ink-2)' }}>
+                  Sorted by biggest catch-up needed first
+                </div>
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, marginTop: 8 }}>
+                    <thead>
+                      <tr>
+                        <th style={{ textAlign: 'left', padding: '10px 20px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Product</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Total Plan</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Plan Till Date</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Actual Till Date</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Shortfall Till Date</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Total Shortfall</th>
+                        <th style={{ textAlign: 'right', padding: '10px 20px', fontSize: 12, fontWeight: 700, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Required / day</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sortedRows.map((r, i) => {
+                        const behind = r.shortfallTillDate != null && r.shortfallTillDate < 0;
+                        const reqNeg = r.requiredPerDay != null && r.requiredPerDay < 0;
+                        return (
+                          <tr key={r.name + i}>
+                            <td style={{ padding: '9px 20px', borderBottom: '1px solid var(--line)' }}>{r.name}</td>
+                            <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)' }}>{fmt(r.totalPlan)}</td>
+                            <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)' }}>{fmt(r.planTillDate)}</td>
+                            <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)' }}>{fmt(r.actualTillDate)}</td>
+                            <td style={{
+                              padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)', fontWeight: behind ? 700 : 400,
+                              background: behind ? 'var(--danger-soft)' : 'transparent', color: behind ? 'var(--danger)' : (r.shortfallTillDate > 0 ? '#1E9E6B' : 'inherit')
+                            }}>{fmt(r.shortfallTillDate)}</td>
+                            <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)', color: r.totalShortfall < 0 ? 'var(--danger)' : (r.totalShortfall > 0 ? '#1E9E6B' : 'inherit') }}>{fmt(r.totalShortfall)}</td>
+                            <td style={{ padding: '9px 20px', textAlign: 'right', borderBottom: '1px solid var(--line)', fontWeight: 700, color: reqNeg ? 'var(--danger)' : (r.requiredPerDay > 0 ? '#1E9E6B' : 'inherit') }}>{fmt(r.requiredPerDay)}</td>
+                          </tr>
+                        );
+                      })}
+                      {data.total && (
+                        <tr>
+                          <td style={{ padding: '11px 20px', fontWeight: 700 }}>Total</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700 }}>{fmt(data.total.totalPlan)}</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700 }}>{fmt(data.total.planTillDate)}</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700 }}>{fmt(data.total.actualTillDate)}</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700, color: 'var(--danger)' }}>{fmt(data.total.shortfallTillDate)}</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700, color: 'var(--danger)' }}>{fmt(data.total.totalShortfall)}</td>
+                          <td style={{ padding: '11px 20px', textAlign: 'right', fontWeight: 700, color: 'var(--danger)' }}>{fmt(data.total.requiredPerDay)}</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </React.Fragment>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
