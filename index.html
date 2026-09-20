@@ -112,17 +112,34 @@ const METRIC_CONFIGS = [
 
 /* ============================================================
    PLAN vs ACTUAL (live Google Sheet)
-   The planning sheet's tabs are named per month, e.g.
-   "CCP Plan vs Actual Sep" — when the month rolls over, update
-   PLAN_MONTH_SUFFIX below (nothing else needs to change).
+   Both the sheet ID and the month suffix are user-editable inside
+   the Plan vs Actual modal (gear icon) and stored in the same
+   backend meta store as everything else — because a NEW Google
+   Sheet gets created every month (not just a new tab), so there
+   is no fixed ID that stays correct on its own. These two
+   constants are only the fallback used the very first time,
+   before anyone has saved a value.
 ============================================================ */
-const PLAN_SHEET_ID = '1npeP0RAHDB-L0ivQwT2hxo4NJMygS7jylWIX5wTmVtk';
-const PLAN_MONTH_SUFFIX = 'Sep';
-const PLAN_TABS = [
-  { key: 'ccp', label: 'CCP Plan', sheetName: 'CCP Plan vs Actual ' + PLAN_MONTH_SUFFIX },
-  { key: 'coil', label: 'Coil Transfer Plan', sheetName: 'Coil Transfer Plan vs Actual ' + PLAN_MONTH_SUFFIX },
-  { key: 'fg', label: 'FG Packing', sheetName: 'FG Packing Plan vs Actual ' + PLAN_MONTH_SUFFIX }
-];
+const PLAN_SHEET_ID_DEFAULT = '1npeP0RAHDB-L0ivQwT2hxo4NJMygS7jylWIX5wTmVtk';
+const PLAN_MONTH_SUFFIX_DEFAULT = 'Sep';
+
+function buildPlanTabs(monthSuffix) {
+  const suf = monthSuffix || PLAN_MONTH_SUFFIX_DEFAULT;
+  return [
+    { key: 'ccp', label: 'CCP Plan', sheetName: 'CCP Plan vs Actual ' + suf },
+    { key: 'coil', label: 'Coil Transfer Plan', sheetName: 'Coil Transfer Plan vs Actual ' + suf },
+    { key: 'fg', label: 'FG Packing', sheetName: 'FG Packing Plan vs Actual ' + suf }
+  ];
+}
+
+// Accepts either a bare Sheet ID or a full Google Sheets URL and returns the ID
+function extractSheetId(input) {
+  const s = (input || '').trim();
+  const m = s.match(/\/d\/([a-zA-Z0-9_-]+)/);
+  if (m) return m[1];
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(s)) return s; // looks like a bare ID already
+  return null;
+}
 
 const cache = {};
 async function sheetGetMeta(key) {
@@ -547,8 +564,8 @@ function parseCsvText(text) {
   return rows;
 }
 
-async function fetchPlanSheetCsv(sheetName) {
-  const url = 'https://docs.google.com/spreadsheets/d/' + PLAN_SHEET_ID +
+async function fetchPlanSheetCsv(sheetId, sheetName) {
+  const url = 'https://docs.google.com/spreadsheets/d/' + sheetId +
     '/gviz/tq?tqx=out:csv&sheet=' + encodeURIComponent(sheetName);
   const res = await fetch(url);
   if (!res.ok) throw new Error('Could not reach the plan sheet (HTTP ' + res.status + ').');
@@ -644,6 +661,9 @@ function IconSun() {
 function IconPlan() {
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>;
 }
+function IconGear() {
+  return <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>;
+}
 
 function Chip({ label, onRemove }) {
   return (
@@ -678,6 +698,9 @@ function App() {
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState(null);
   const [planData, setPlanData] = useState(null);
+  const [planSheetId, setPlanSheetId] = useState(PLAN_SHEET_ID_DEFAULT);
+  const [planMonthSuffix, setPlanMonthSuffix] = useState(PLAN_MONTH_SUFFIX_DEFAULT);
+  const [planSettingsLoaded, setPlanSettingsLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [uploading, setUploading] = useState(false);
@@ -716,27 +739,55 @@ function App() {
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
+  // load the saved Plan-sheet settings (ID + month suffix) once, the first
+  // time the modal is opened — falls back to the hardcoded defaults if
+  // nothing has been saved yet
   useEffect(() => {
-    if (!showPlanModal) return;
-    const tab = PLAN_TABS.find(t => t.key === planTabKey);
+    if (!showPlanModal || planSettingsLoaded) return;
+    let cancelled = false;
+    Promise.all([sheetGetMeta('plan-sheet-id'), sheetGetMeta('plan-month-suffix')])
+      .then(([savedId, savedSuffix]) => {
+        if (cancelled) return;
+        if (savedId) setPlanSheetId(savedId);
+        if (savedSuffix) setPlanMonthSuffix(savedSuffix);
+        setPlanSettingsLoaded(true);
+      })
+      .catch(() => { if (!cancelled) setPlanSettingsLoaded(true); });
+    return () => { cancelled = true; };
+  }, [showPlanModal, planSettingsLoaded]);
+
+  const savePlanSettings = useCallback(async (newSheetId, newSuffix) => {
+    setPlanSheetId(newSheetId);
+    setPlanMonthSuffix(newSuffix);
+    await Promise.all([
+      sheetSetMeta('plan-sheet-id', newSheetId),
+      sheetSetMeta('plan-month-suffix', newSuffix)
+    ]);
+  }, []);
+
+  const planTabs = useMemo(() => buildPlanTabs(planMonthSuffix), [planMonthSuffix]);
+
+  useEffect(() => {
+    if (!showPlanModal || !planSettingsLoaded) return;
+    const tab = planTabs.find(t => t.key === planTabKey);
     if (!tab) return;
     let cancelled = false;
     setPlanLoading(true); setPlanError(null);
-    fetchPlanSheetCsv(tab.sheetName)
+    fetchPlanSheetCsv(planSheetId, tab.sheetName)
       .then(rows => {
         if (cancelled) return;
         const parsed = parsePlanCatchup(rows);
         if (!parsed.rows.length) {
-          setPlanError('Could not find a Plan/Actual/Shortfall table on the "' + tab.sheetName + '" tab.');
+          setPlanError('Could not find a Plan/Actual/Shortfall table on the "' + tab.sheetName + '" tab. If a new sheet was created this month, update the link in Settings above.');
           setPlanData(null);
         } else {
           setPlanData(parsed);
         }
       })
-      .catch(e => { if (!cancelled) { setPlanError(e.message || 'Could not load the plan sheet.'); setPlanData(null); } })
+      .catch(e => { if (!cancelled) { setPlanError((e.message || 'Could not load the plan sheet.') + ' If a new sheet was created this month, update the link in Settings above.'); setPlanData(null); } })
       .finally(() => { if (!cancelled) setPlanLoading(false); });
     return () => { cancelled = true; };
-  }, [showPlanModal, planTabKey]);
+  }, [showPlanModal, planTabKey, planSheetId, planTabs, planSettingsLoaded]);
 
   const rows = useMemo(() => {
     if (!allRows || !fromDate || !toDate) return allRows === null ? null : [];
@@ -1221,6 +1272,9 @@ function App() {
           onClose={() => setShowPlanModal(false)}
           planTabKey={planTabKey} setPlanTabKey={setPlanTabKey}
           loading={planLoading} error={planError} data={planData}
+          planTabs={planTabs}
+          planSheetId={planSheetId} planMonthSuffix={planMonthSuffix}
+          onSaveSettings={savePlanSettings}
         />
       )}
     </div>
@@ -1488,8 +1542,12 @@ function StatRow({ qty, total, entries, fmt }) {
 /* ============================================================
    PLAN vs ACTUAL MODAL
 ============================================================ */
-function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data }) {
+function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, planTabs, planSheetId, planMonthSuffix, onSaveSettings }) {
   const fmt = n => n == null ? '-' : Math.round(n).toLocaleString('en-IN');
+  const [showSettings, setShowSettings] = useState(false);
+  const [linkDraft, setLinkDraft] = useState(planSheetId);
+  const [suffixDraft, setSuffixDraft] = useState(planMonthSuffix);
+  const [settingsError, setSettingsError] = useState(null);
 
   // biggest shortfall first — the rows that need the most catching up
   const sortedRows = useMemo(() => {
@@ -1500,6 +1558,16 @@ function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data })
   const achievement = data && data.total && data.total.planTillDate
     ? Math.round((data.total.actualTillDate / data.total.planTillDate) * 100)
     : null;
+
+  function handleSaveSettings() {
+    const id = extractSheetId(linkDraft);
+    if (!id) { setSettingsError('That doesn\'t look like a Google Sheets link or ID.'); return; }
+    const suf = suffixDraft.trim();
+    if (!suf) { setSettingsError('Month suffix can\'t be empty (e.g. "Sep", "Oct").'); return; }
+    setSettingsError(null);
+    onSaveSettings(id, suf);
+    setShowSettings(false);
+  }
 
   return (
     <div style={{
@@ -1515,15 +1583,55 @@ function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data })
           padding: '16px 24px', display: 'flex', alignItems: 'center', gap: 12, zIndex: 2
         }}>
           <span style={{ fontSize: 16, fontWeight: 700 }}>Plan vs Actual</span>
+          <button onClick={() => { setLinkDraft(planSheetId); setSuffixDraft(planMonthSuffix); setSettingsError(null); setShowSettings(s => !s); }}
+            className="focus-ring" aria-label="Plan sheet settings"
+            style={{
+              display: 'flex', alignItems: 'center', gap: 6, marginLeft: 8, padding: '6px 10px', borderRadius: 8,
+              border: '1px solid var(--line-strong)', background: showSettings ? 'var(--surface-2)' : 'var(--surface)',
+              color: 'var(--ink-2)', fontSize: 12, fontWeight: 600
+            }}>
+            <IconGear /> Settings
+          </button>
           <button onClick={onClose} className="focus-ring" aria-label="Close"
             style={{ marginLeft: 'auto', background: 'none', border: 'none', display: 'flex', padding: 6, borderRadius: 8, color: 'var(--ink-2)' }}>
             <IconX />
           </button>
         </div>
 
+        {showSettings && (
+          <div style={{ padding: '16px 24px', background: 'var(--surface-2)', borderBottom: '1px solid var(--line)' }}>
+            <div style={{ fontSize: 12.5, color: 'var(--ink-2)', marginBottom: 10 }}>
+              A new Google Sheet is created for this plan every month. Paste this month's sheet link here once — no code change needed after that.
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'flex-end' }}>
+              <div style={{ flex: '1 1 320px' }}>
+                <label style={{ fontSize: 11, color: 'var(--ink-3)', display: 'block', marginBottom: 3 }}>Google Sheet link (or ID)</label>
+                <input value={linkDraft} onChange={e => setLinkDraft(e.target.value)}
+                  placeholder="https://docs.google.com/spreadsheets/d/..."
+                  className="focus-ring"
+                  style={{ width: '100%', padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)' }} />
+              </div>
+              <div style={{ width: 110 }}>
+                <label style={{ fontSize: 11, color: 'var(--ink-3)', display: 'block', marginBottom: 3 }}>Month suffix</label>
+                <input value={suffixDraft} onChange={e => setSuffixDraft(e.target.value)}
+                  placeholder="Sep"
+                  className="focus-ring"
+                  style={{ width: '100%', padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)' }} />
+              </div>
+              <button onClick={handleSaveSettings} className="focus-ring" style={{
+                padding: '8px 16px', borderRadius: 8, border: 'none', background: 'var(--accent)', color: 'var(--accent-ink)', fontWeight: 700, fontSize: 13
+              }}>Save</button>
+            </div>
+            {settingsError && <div style={{ fontSize: 12, color: 'var(--danger)', marginTop: 8 }}>{settingsError}</div>}
+            <div style={{ fontSize: 11, color: 'var(--ink-3)', marginTop: 8 }}>
+              Tab names looked for: "CCP Plan vs Actual {suffixDraft || planMonthSuffix}", "Coil Transfer Plan vs Actual {suffixDraft || planMonthSuffix}", "FG Packing Plan vs Actual {suffixDraft || planMonthSuffix}". Saved for everyone who opens this dashboard.
+            </div>
+          </div>
+        )}
+
         <div style={{ padding: '20px 24px 28px' }}>
           <div style={{ display: 'flex', gap: 4, background: 'var(--surface-2)', border: '1px solid var(--line)', borderRadius: 8, padding: 3, width: 'fit-content', marginBottom: 18 }}>
-            {PLAN_TABS.map(t => (
+            {planTabs.map(t => (
               <button key={t.key} onClick={() => setPlanTabKey(t.key)} className="focus-ring" style={{
                 padding: '7px 16px', borderRadius: 6, border: 'none', fontSize: 13, fontWeight: 700,
                 background: t.key === planTabKey ? 'var(--surface)' : 'transparent',
