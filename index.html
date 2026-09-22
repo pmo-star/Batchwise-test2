@@ -973,6 +973,7 @@ function App() {
   const [planDataSavedAt, setPlanDataSavedAt] = useState(null);
   const [loading, setLoading] = useState(true);
   const [loadElapsedMs, setLoadElapsedMs] = useState(null);
+  const [loadMetrics, setLoadMetrics] = useState(null);
   const [error, setError] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [toast, setToast] = useState(null);
@@ -994,10 +995,12 @@ function App() {
   }, [allRows]);
 
   const loadAll = useCallback(async () => {
-    setLoading(true); setError(null); setLoadElapsedMs(null);
+    setLoading(true); setError(null); setLoadElapsedMs(null); setLoadMetrics(null);
     const startedAt = performance.now();
     try {
-      const rows = await getAllRowsRemote();
+      const rows = await getAllRowsRemote(progress => {
+        if (progress && progress.timing) setLoadMetrics(progress.timing);
+      });
       setAllRows(rows);
       const dates = Array.from(new Set(rows.map(r => r.date))).sort().reverse();
       setFromDate(prev => (prev && dates.includes(prev)) ? prev : (dates[0] || null));
@@ -1410,6 +1413,7 @@ function App() {
         uploadProgress={uploadProgress}
         onOpenPlan={() => setShowPlanModal(true)}
         loadElapsedMs={loadElapsedMs}
+        loadMetrics={loadMetrics}
       />
       <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.pdf" multiple style={{ display: 'none' }}
         onChange={e => { if (e.target.files.length) handleFiles(e.target.files); e.target.value = ''; }} />
@@ -1577,7 +1581,7 @@ function App() {
   );
 }
 
-function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, canExport, uploading, uploadProgress, onOpenPlan, loadElapsedMs }) {
+function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, canExport, uploading, uploadProgress, onOpenPlan, loadElapsedMs, loadMetrics }) {
   return (
     <header style={{ borderBottom: '1px solid var(--line)', background: 'var(--surface)', position: 'sticky', top: 0, zIndex: 10 }}>
       <div className="topbar-row" style={{ maxWidth: 1650, margin: '0 auto', padding: '14px 24px', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
@@ -1638,6 +1642,19 @@ function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, c
           </button>
         </div>
       </div>
+      {loadMetrics && (
+        <div style={{ maxWidth: 1650, margin: '0 auto', padding: '0 24px 10px' }}>
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', padding: '7px 11px', border: '1px solid var(--line)', borderRadius: 8, background: 'var(--surface-2)', color: 'var(--ink-2)', fontSize: 11.5 }}>
+            <strong style={{ color: 'var(--ink)' }}>Load benchmark</strong>
+            <span>Local: <b>{Math.round(loadMetrics.localReadMs)} ms</b></span>
+            <span>Firestore: <b>{Math.round(loadMetrics.firestoreMs)} ms</b></span>
+            <span>Parse/cache: <b>{Math.round(loadMetrics.parseCacheMs)} ms</b></span>
+            <span>Docs: <b>{loadMetrics.docs}</b></span>
+            <span>Rows: <b>{loadMetrics.rows.toLocaleString('en-IN')}</b></span>
+            <span>Total: <b style={{ color: 'var(--accent)' }}>{(loadMetrics.totalMs / 1000).toFixed(2)} s</b></span>
+          </div>
+        </div>
+      )}
       <div style={{
         maxWidth: 1650, margin: '0 auto', padding: '0 24px 10px',
         fontSize: 12, color: 'var(--ink-2)', textAlign: 'right',
