@@ -86,8 +86,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
 
 <script type="text/babel-jsx" id="app-source">
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
@@ -117,8 +115,6 @@ const firebaseConfig = {
   messagingSenderId: "860012761430",
   appId: "1:860012761430:web:fd594b857ed13f167e06f7"
 };
-firebase.initializeApp(firebaseConfig);
-const db = firebase.firestore();
 
 const GROUP_MAP = {
   ZCCP: 'CCP', ZMILL: 'CCP', ZPULV: 'CCP', ZCH01: 'CCP',
@@ -164,60 +160,134 @@ function extractSheetId(input) {
 }
 
 /* ============================================================
-   FIRESTORE TRANSPORT LAYER
-   One document per date in the "batchRows" collection (its
-   content is the array of that date's rows) — this keeps reads
-   cheap even as data grows across years, because each upload
-   only touches the dates it actually contains, and getAllRowsRemote
-   reads the whole collection in a single query (one round-trip)
-   rather than one read per date.
+   FIRESTORE TRANSPORT LAYER — plain REST, no Firebase SDK.
+   Google's own Firestore docs say every SDK read — even a single
+   one-shot .get() — runs as a "short-lived snapshot listener":
+   a polling-then-listen model built for real-time sync. We never
+   need real-time updates here, so that machinery is pure overhead
+   (it's what was making the page slow after the SDK migration).
+   The REST API instead does a plain point lookup over normal
+   HTTPS — no channel, no listener, no persistent connection — so
+   this bypasses the SDK (and its ~140KB of scripts) entirely.
+   One document per date in "batchRows" (its content is that
+   date's row array); getAllRowsRemote lists the whole collection
+   in one paginated REST call rather than one request per date.
 ============================================================ */
+const FIRESTORE_BASE = 'https://firestore.googleapis.com/v1/projects/' + firebaseConfig.projectId + '/databases/(default)/documents';
+const FIRESTORE_KEY = firebaseConfig.apiKey;
 const cache = {};
+
+function toFirestoreValue(v) {
+  if (v === null || v === undefined) return { nullValue: null };
+  if (typeof v === 'boolean') return { booleanValue: v };
+  if (typeof v === 'number') return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+  if (Array.isArray(v)) return { arrayValue: { values: v.map(toFirestoreValue) } };
+  if (typeof v === 'object') {
+    const fields = {};
+    Object.keys(v).forEach(k => { fields[k] = toFirestoreValue(v[k]); });
+    return { mapValue: { fields } };
+  }
+  return { stringValue: String(v) };
+}
+function fromFirestoreValue(fv) {
+  if (!fv) return null;
+  if ('nullValue' in fv) return null;
+  if ('booleanValue' in fv) return fv.booleanValue;
+  if ('integerValue' in fv) return Number(fv.integerValue);
+  if ('doubleValue' in fv) return fv.doubleValue;
+  if ('stringValue' in fv) return fv.stringValue;
+  if ('arrayValue' in fv) return (fv.arrayValue.values || []).map(fromFirestoreValue);
+  if ('mapValue' in fv) {
+    const out = {};
+    const fields = fv.mapValue.fields || {};
+    Object.keys(fields).forEach(k => { out[k] = fromFirestoreValue(fields[k]); });
+    return out;
+  }
+  return null;
+}
+function docFieldsToObject(doc) {
+  const out = {};
+  const fields = (doc && doc.fields) || {};
+  Object.keys(fields).forEach(k => { out[k] = fromFirestoreValue(fields[k]); });
+  return out;
+}
+
+async function firestoreGetDoc(path) {
+  const res = await fetch(FIRESTORE_BASE + '/' + path + '?key=' + FIRESTORE_KEY);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error('Firestore read failed (HTTP ' + res.status + ').');
+  return docFieldsToObject(await res.json());
+}
+async function firestoreSetDoc(path, obj) {
+  const fields = {};
+  Object.keys(obj).forEach(k => { fields[k] = toFirestoreValue(obj[k]); });
+  const mask = Object.keys(obj).map(k => 'updateMask.fieldPaths=' + encodeURIComponent(k)).join('&');
+  const res = await fetch(FIRESTORE_BASE + '/' + path + '?key=' + FIRESTORE_KEY + '&' + mask, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields })
+  });
+  if (!res.ok) throw new Error('Firestore write failed (HTTP ' + res.status + ').');
+}
+async function firestoreDeleteDoc(path) {
+  const res = await fetch(FIRESTORE_BASE + '/' + path + '?key=' + FIRESTORE_KEY, { method: 'DELETE' });
+  if (!res.ok && res.status !== 404) throw new Error('Firestore delete failed (HTTP ' + res.status + ').');
+}
+async function firestoreListCollection(collection) {
+  const out = [];
+  let pageToken = null;
+  do {
+    let url = FIRESTORE_BASE + '/' + collection + '?key=' + FIRESTORE_KEY + '&pageSize=300';
+    if (pageToken) url += '&pageToken=' + encodeURIComponent(pageToken);
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Firestore list failed (HTTP ' + res.status + ').');
+    const json = await res.json();
+    (json.documents || []).forEach(doc => {
+      out.push({ id: doc.name.split('/').pop(), data: docFieldsToObject(doc) });
+    });
+    pageToken = json.nextPageToken || null;
+  } while (pageToken);
+  return out;
+}
 
 async function sheetGetMeta(key) {
   const cacheKey = 'meta:' + key;
   if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) return cache[cacheKey];
-  const snap = await db.collection('meta').doc(key).get();
-  const val = snap.exists && snap.data().value !== undefined ? snap.data().value : null;
+  const data = await firestoreGetDoc('meta/' + encodeURIComponent(key));
+  const val = data && data.value !== undefined ? data.value : null;
   cache[cacheKey] = val;
   return val;
 }
 async function sheetSetMeta(key, value) {
   cache['meta:' + key] = value;
-  await db.collection('meta').doc(key).set({ value });
+  await firestoreSetDoc('meta/' + encodeURIComponent(key), { value });
 }
 async function getDayRows(dateKey) {
   const cacheKey = 'rows:' + dateKey;
   if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) return cache[cacheKey];
-  const snap = await db.collection('batchRows').doc(dateKey).get();
-  const rows = snap.exists && snap.data().rows ? snap.data().rows : [];
+  const data = await firestoreGetDoc('batchRows/' + encodeURIComponent(dateKey));
+  const rows = (data && data.rows) || [];
   cache[cacheKey] = rows;
   return rows;
 }
 async function setDayRows(dateKey, rows) {
   cache['rows:' + dateKey] = rows;
   if (!rows || !rows.length) {
-    await db.collection('batchRows').doc(dateKey).delete();
+    await firestoreDeleteDoc('batchRows/' + encodeURIComponent(dateKey));
   } else {
-    await db.collection('batchRows').doc(dateKey).set({ rows, updatedAt: Date.now() });
+    await firestoreSetDoc('batchRows/' + encodeURIComponent(dateKey), { rows, updatedAt: Date.now() });
   }
 }
 
-// ONE query for the whole collection instead of one read per date.
-// Firestore returns every matching document in a single network
-// round-trip no matter how many there are, so this stays fast even
-// as the number of dates grows — the earlier per-date Promise.all
-// approach queued 30+ separate reads one after another on the same
-// connection, which is what made the page slow to load.
+// ONE paginated list call for the whole collection instead of one
+// request per date — stays fast even as the number of dates grows.
 async function getAllRowsRemote() {
-  const snap = await db.collection('batchRows').get();
+  const docs = await firestoreListCollection('batchRows');
   const all = [];
-  snap.forEach(doc => {
-    const d = doc.id;
-    const data = doc.data();
+  docs.forEach(({ id, data }) => {
     const rowsArr = (data && data.rows) || [];
-    cache['rows:' + d] = rowsArr;
-    rowsArr.forEach(r => all.push({ ...r, date: d }));
+    cache['rows:' + id] = rowsArr;
+    rowsArr.forEach(r => all.push({ ...r, date: id }));
   });
   return all;
 }
