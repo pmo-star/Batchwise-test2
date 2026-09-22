@@ -167,11 +167,10 @@ function extractSheetId(input) {
    FIRESTORE TRANSPORT LAYER
    One document per date in the "batchRows" collection (its
    content is the array of that date's rows) — this keeps reads
-   cheap even as data grows across years, because loading a date
-   range costs one document read per date, not one per row.
-   A single "meta/v3-date-index" document holds the list of dates
-   that have data, so the app never has to scan the whole
-   collection just to know which dates exist.
+   cheap even as data grows across years, because each upload
+   only touches the dates it actually contains, and getAllRowsRemote
+   reads the whole collection in a single query (one round-trip)
+   rather than one read per date.
 ============================================================ */
 const cache = {};
 
@@ -187,12 +186,6 @@ async function sheetSetMeta(key, value) {
   cache['meta:' + key] = value;
   await db.collection('meta').doc(key).set({ value });
 }
-async function getDateIndex() {
-  const raw = await sheetGetMeta('v3-date-index');
-  try { return raw ? JSON.parse(raw) : []; } catch (e) { return []; }
-}
-async function setDateIndex(list) { await sheetSetMeta('v3-date-index', JSON.stringify(list)); }
-
 async function getDayRows(dateKey) {
   const cacheKey = 'rows:' + dateKey;
   if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) return cache[cacheKey];
@@ -208,24 +201,23 @@ async function setDayRows(dateKey, rows) {
   } else {
     await db.collection('batchRows').doc(dateKey).set({ rows, updatedAt: Date.now() });
   }
-  const idx = await getDateIndex();
-  const has = idx.includes(dateKey);
-  if ((!rows || !rows.length) && has) {
-    delete cache['meta:v3-date-index'];
-    await setDateIndex(idx.filter(d => d !== dateKey));
-  } else if (rows && rows.length && !has) {
-    idx.push(dateKey);
-    delete cache['meta:v3-date-index'];
-    await setDateIndex(idx);
-  }
 }
 
+// ONE query for the whole collection instead of one read per date.
+// Firestore returns every matching document in a single network
+// round-trip no matter how many there are, so this stays fast even
+// as the number of dates grows — the earlier per-date Promise.all
+// approach queued 30+ separate reads one after another on the same
+// connection, which is what made the page slow to load.
 async function getAllRowsRemote() {
-  const dates = await getDateIndex();
-  const perDate = await Promise.all(dates.map(d => getDayRows(d)));
+  const snap = await db.collection('batchRows').get();
   const all = [];
-  dates.forEach((d, i) => {
-    (perDate[i] || []).forEach(r => all.push({ ...r, date: d }));
+  snap.forEach(doc => {
+    const d = doc.id;
+    const data = doc.data();
+    const rowsArr = (data && data.rows) || [];
+    cache['rows:' + d] = rowsArr;
+    rowsArr.forEach(r => all.push({ ...r, date: d }));
   });
   return all;
 }
