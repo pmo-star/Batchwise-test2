@@ -94,8 +94,19 @@ if (typeof pdfjsLib !== 'undefined') {
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
 }
 
+/* ============================================================
+   CONFIG
+============================================================ */
 const GOOGLE_SHEET_API_URL = 'https://script.google.com/macros/s/AKfycbzkfY8LRSrbi7gsWXYjXYnu_h5C31uPJibO2Nm7sDuNtF493GhTuI8JAj4uAVL5gUvh/exec';
 
+/* ============================================================
+   FIREBASE (replaces the old Google-Sheet-via-Apps-Script
+   transport for the tracker's own batch data + settings meta).
+   The Apps Script backend above is still used for ONE thing:
+   reading the separate monthly "Plan vs Actual" Google Sheet
+   (fetchPlanSheetCsv / action=getPlanRows), since Firestore can't
+   read a Google Sheet directly.
+============================================================ */
 const firebaseConfig = {
   apiKey: "AIzaSyDX1AunKy4e5QOTmvEiKCJv9K9SxSUFhxs",
   authDomain: "batchwise-trends.firebaseapp.com",
@@ -117,6 +128,16 @@ const METRIC_CONFIGS = [
   { key: 'labour', label: 'Labour', fields: ['labD', 'labI'], batchKey: 'labTotalRate' }
 ];
 
+/* ============================================================
+   PLAN vs ACTUAL (live Google Sheet)
+   Both the sheet ID and the month suffix are user-editable inside
+   the Plan vs Actual modal (gear icon) and stored in the same
+   backend meta store as everything else — because a NEW Google
+   Sheet gets created every month (not just a new tab), so there
+   is no fixed ID that stays correct on its own. These two
+   constants are only the fallback used the very first time,
+   before anyone has saved a value.
+============================================================ */
 const PLAN_SHEET_ID_DEFAULT = '1npeP0RAHDB-L0ivQwT2hxo4NJMygS7jylWIX5wTmVtk';
 const PLAN_MONTH_SUFFIX_DEFAULT = 'Sep';
 
@@ -129,14 +150,29 @@ function buildPlanTabs(monthSuffix) {
   ];
 }
 
+// Accepts either a bare Sheet ID or a full Google Sheets URL and returns the ID
 function extractSheetId(input) {
   const s = (input || '').trim();
   const m = s.match(/\/d\/([a-zA-Z0-9_-]+)/);
   if (m) return m[1];
-  if (/^[a-zA-Z0-9_-]{20,}$/.test(s)) return s;
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(s)) return s; // looks like a bare ID already
   return null;
 }
 
+/* ============================================================
+   FIRESTORE TRANSPORT LAYER — plain REST, no Firebase SDK.
+   Google's own Firestore docs say every SDK read — even a single
+   one-shot .get() — runs as a "short-lived snapshot listener":
+   a polling-then-listen model built for real-time sync. We never
+   need real-time updates here, so that machinery is pure overhead
+   (it's what was making the page slow after the SDK migration).
+   The REST API instead does a plain point lookup over normal
+   HTTPS — no channel, no listener, no persistent connection — so
+   this bypasses the SDK (and its ~140KB of scripts) entirely.
+   One document per date in "batchRows" (its content is that
+   date's row array); getAllRowsRemote lists the whole collection
+   in one paginated REST call rather than one request per date.
+============================================================ */
 const FIRESTORE_BASE = 'https://firestore.googleapis.com/v1/projects/' + firebaseConfig.projectId + '/databases/(default)/documents';
 const FIRESTORE_KEY = firebaseConfig.apiKey;
 const cache = {};
@@ -153,7 +189,6 @@ function toFirestoreValue(v) {
   }
   return { stringValue: String(v) };
 }
-
 function fromFirestoreValue(fv) {
   if (!fv) return null;
   if ('nullValue' in fv) return null;
@@ -170,7 +205,6 @@ function fromFirestoreValue(fv) {
   }
   return null;
 }
-
 function docFieldsToObject(doc) {
   const out = {};
   const fields = (doc && doc.fields) || {};
@@ -184,7 +218,6 @@ async function firestoreGetDoc(path) {
   if (!res.ok) throw new Error('Firestore read failed (HTTP ' + res.status + ').');
   return docFieldsToObject(await res.json());
 }
-
 async function firestoreSetDoc(path, obj) {
   const fields = {};
   Object.keys(obj).forEach(k => { fields[k] = toFirestoreValue(obj[k]); });
@@ -196,12 +229,10 @@ async function firestoreSetDoc(path, obj) {
   });
   if (!res.ok) throw new Error('Firestore write failed (HTTP ' + res.status + ').');
 }
-
 async function firestoreDeleteDoc(path) {
   const res = await fetch(FIRESTORE_BASE + '/' + path + '?key=' + FIRESTORE_KEY, { method: 'DELETE' });
   if (!res.ok && res.status !== 404) throw new Error('Firestore delete failed (HTTP ' + res.status + ').');
 }
-
 async function firestoreListCollection(collection) {
   const out = [];
   let pageToken = null;
@@ -227,18 +258,30 @@ async function sheetGetMeta(key) {
   cache[cacheKey] = val;
   return val;
 }
-
 async function sheetSetMeta(key, value) {
   cache['meta:' + key] = value;
   await firestoreSetDoc('meta/' + encodeURIComponent(key), { value });
 }
-
 async function getDayRows(dateKey) {
-  const cacheKey = 'rows:' + dateKey;
-  if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) return cache[cacheKey];
-  const data = await firestoreGetDoc('batchRows/' + encodeURIComponent(dateKey));
-  const rows = (data && data.rows) || [];
-  cache[cacheKey] = rows;
+  if (cache['rows:' + dateKey]) {
+    return cache['rows:' + dateKey];
+  }
+
+  const doc = await firestoreGetDoc('batchRows/' + encodeURIComponent(dateKey));
+  if (!doc) return [];
+
+  let rows = [];
+  if (doc.payload) {
+    try {
+      rows = JSON.parse(doc.payload);
+    } catch(e) {
+      console.error(e);
+    }
+  } else if (doc.rows) {
+    rows = doc.rows;
+  }
+
+  cache['rows:' + dateKey] = rows;
   return rows;
 }
 
@@ -247,23 +290,78 @@ async function setDayRows(dateKey, rows) {
   if (!rows || !rows.length) {
     await firestoreDeleteDoc('batchRows/' + encodeURIComponent(dateKey));
   } else {
-    await firestoreSetDoc('batchRows/' + encodeURIComponent(dateKey), { rows, updatedAt: Date.now() });
+    await firestoreSetDoc('batchRows/' + encodeURIComponent(dateKey), {
+      payload: JSON.stringify(rows),
+      updatedAt: Date.now()
+    });
   }
 }
 
+const LOCAL_CACHE_KEY = 'bwt_cache_rows_v1';
+
+// ONE paginated list call for the whole collection instead of one
+// request per date — stays fast even as the number of dates grows.
 async function getAllRowsRemote() {
+  // 1. Pehle LocalStorage se cached data instant read karein
+  const localData = localStorage.getItem(LOCAL_CACHE_KEY);
+  let localCache = {};
+  if (localData) {
+    try {
+      localCache = JSON.parse(localData) || {};
+    } catch (e) {
+      console.warn('LocalStorage cache parse failed', e);
+    }
+  }
+
+  // App memory cache me store karein taaki screen turant load ho sake
+  for (const dateKey in localCache) {
+    cache['rows:' + dateKey] = localCache[dateKey];
+  }
+
+  // 2. Firestore se payload fetch karein
   const docs = await firestoreListCollection('batchRows');
   const all = [];
+  const updatedLocalCache = {};
+
   docs.forEach(({ id, data }) => {
-    const rowsArr = (data && data.rows) || [];
+    let rowsArr = [];
+
+    // Naye Stringified Payload ko parse karein
+    if (data && data.payload) {
+      try {
+        rowsArr = JSON.parse(data.payload);
+      } catch (e) {
+        console.error('Parsing error on date:', id, e);
+      }
+    } else if (data && data.rows) {
+      // Purane format wale data ke liye backward compatibility fallback
+      rowsArr = data.rows;
+    }
+
     cache['rows:' + id] = rowsArr;
+    updatedLocalCache[id] = rowsArr;
+
     rowsArr.forEach(r => all.push({ ...r, date: id }));
   });
+
+  // 3. Agli baar ke liye LocalStorage me store kar dein
+  try {
+    localStorage.setItem(LOCAL_CACHE_KEY, JSON.stringify(updatedLocalCache));
+  } catch (e) {
+    console.warn('LocalStorage limit exceeded', e);
+  }
+
   return all;
 }
 
+
 function normalizeHeader(h) {
-  return String(h == null ? '' : h).replace(/\u00A0/g, ' ').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+  return String(h == null ? '' : h)
+    .replace(/\u00A0/g, ' ')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
 }
 
 function findCol(headers, exact, contains, exclude) {
@@ -287,8 +385,14 @@ function findCol(headers, exact, contains, exclude) {
 }
 
 function findCostColumns(headers, family, type) {
-  const amount = findCol(headers, [family + ' Amount'], [family.toLowerCase(), 'amount']);
-  const rate = findCol(headers, [family + ' Rs/KG', family + ' Rs/Kg', family + ' Rs/kg'], [family.toLowerCase(), 'rs/kg']);
+  const amount = findCol(headers,
+    [family + ' Amount'],
+    [family.toLowerCase(), 'amount']
+  );
+  const rate = findCol(headers,
+    [family + ' Rs/KG', family + ' Rs/Kg', family + ' Rs/kg'],
+    [family.toLowerCase(), 'rs/kg']
+  );
   return { amount, rate, type };
 }
 
@@ -312,7 +416,6 @@ function dateToKey(val) {
   }
   return 'unknown';
 }
-
 function keyToLabel(key) {
   if (key === 'unknown') return 'Unknown date';
   const [y, m, d] = key.split('-');
@@ -322,12 +425,16 @@ function keyToLabel(key) {
 
 function parseDateTimeMs(val) {
   if (val == null || val === '') return null;
-  if (typeof val === 'number' && isFinite(val)) return Date.UTC(1899, 11, 30) + val * 86400000;
+  if (typeof val === 'number' && isFinite(val)) {
+    return Date.UTC(1899, 11, 30) + val * 86400000;
+  }
   if (val instanceof Date && !isNaN(val)) return val.getTime();
   if (typeof val === 'string') {
     const s = val.trim();
     const m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/);
-    if (m) return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+    if (m) {
+      return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+    }
     const d = new Date(s);
     if (!isNaN(d)) return d.getTime();
   }
@@ -358,7 +465,10 @@ function normKey(s) {
 
 function num(v) {
   if (typeof v === 'number') return isFinite(v) ? v : 0;
-  const cleaned = String(v == null ? '' : v).replace(/,/g, '').replace(/₹/g, '').trim();
+  const cleaned = String(v == null ? '' : v)
+    .replace(/,/g, '')
+    .replace(/₹/g, '')
+    .trim();
   const n = parseFloat(cleaned);
   return isFinite(n) ? n : 0;
 }
@@ -369,7 +479,7 @@ async function extractRowsFromPdf(arrayBuffer) {
 
   const dataRows = [];
   let headerRow = null;
-  let headerX = null;
+  let headerX = null; // x-position of each header cell — used as column boundaries
 
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
@@ -397,6 +507,13 @@ async function extractRowsFromPdf(arrayBuffer) {
       }
 
       if (headerX) {
+        // Some SAP exports leave a cell blank (e.g. Batch Confirm Qty for a
+        // DROSS/recovery batch) — pdf.js then emits no text item at all for
+        // that position. Reading data rows by plain left-to-right token
+        // order would silently shift every later column back by one for
+        // that row. Bucketing each token by which header column's x-range
+        // it actually falls into keeps a blank cell blank instead, so every
+        // later value — Start/End Time included — lands in the right place.
         const buckets = headerX.map(() => []);
         items.forEach(it => {
           let col = 0;
@@ -407,6 +524,7 @@ async function extractRowsFromPdf(arrayBuffer) {
         });
         dataRows.push(buckets.map(b => b.join(' ').trim()));
       } else {
+        // header not captured yet on this page — fall back to plain order
         dataRows.push(items.map(it => it.str));
       }
     });
@@ -450,11 +568,21 @@ async function parseWorkbook(arrayBuffer, isPdf) {
   const labDCols = findCostColumns(headers, 'Labour Direct', 'labD');
   const labICols = findCostColumns(headers, 'Labour Indirect', 'labI');
 
-  const totalAmountCol = findCol(headers, ['Total Amount (Direct + Indirect)', 'Total Amount'], ['total', 'amount']);
-  const totalRateCol = findCol(headers, ['Total Rs/KG', 'Total Rs/Kg', 'Total Rs/kg'], ['total', 'rs/kg']);
+  const totalAmountCol = findCol(headers,
+    ['Total Amount (Direct + Indirect)', 'Total Amount'],
+    ['total', 'amount']
+  );
+  const totalRateCol = findCol(headers,
+    ['Total Rs/KG', 'Total Rs/Kg', 'Total Rs/kg'],
+    ['total', 'rs/kg']
+  );
 
-  if (locCol === -1 || wcCol === -1) throw new Error('Could not find Storage Location / Work Center columns in this file.');
-  if (qtyCol === -1) throw new Error('Could not find Quantity / Qty column in this file.');
+  if (locCol === -1 || wcCol === -1) {
+    throw new Error('Could not find Storage Location / Work Center columns in this file.');
+  }
+  if (qtyCol === -1) {
+    throw new Error('Could not find Quantity / Qty column in this file.');
+  }
 
   function costValue(r, cols, qty) {
     if (cols.amount !== -1) return num(r[cols.amount]);
@@ -492,7 +620,9 @@ async function parseWorkbook(arrayBuffer, isPdf) {
       labI: costValue(r, labICols, qty),
       powerD: costValue(r, powerDCols, qty),
       powerI: costValue(r, powerICols, qty),
-      total: totalAmountCol !== -1 ? num(r[totalAmountCol]) : (totalRateCol !== -1 ? num(r[totalRateCol]) * qty : 0)
+      total: totalAmountCol !== -1
+        ? num(r[totalAmountCol])
+        : (totalRateCol !== -1 ? num(r[totalRateCol]) * qty : 0)
     };
 
     if (!byDate[dateKey]) byDate[dateKey] = [];
@@ -518,14 +648,24 @@ function aggregateBy(rows, keyFn, nameFn) {
         runTime: r.runTime != null ? r.runTime : null,
         count: 0,
         qty: 0,
-        storeD: 0, storeI: 0, labD: 0, labI: 0, powerD: 0, powerI: 0, total: 0,
-        wcs: {}, mats: {}, matCodes: {}
+        storeD: 0,
+        storeI: 0,
+        labD: 0,
+        labI: 0,
+        powerD: 0,
+        powerI: 0,
+        total: 0,
+        wcs: {},
+        mats: {},
+        matCodes: {}
       };
     }
 
     const b = buckets[k];
     b.count++;
-    ['qty','storeD','storeI','labD','labI','powerD','powerI','total'].forEach(f => b[f] += r[f]);
+
+    ['qty','storeD','storeI','labD','labI','powerD','powerI','total']
+      .forEach(f => b[f] += r[f]);
 
     if (r.wc) { const nk = normKey(r.wc); b.wcs[nk] = nk; }
     if (r.mat) { const nk = normKey(r.mat); if (!b.mats[nk]) b.mats[nk] = r.mat.trim(); }
@@ -552,15 +692,58 @@ function aggregateBy(rows, keyFn, nameFn) {
     .sort((a, b) => b.qty - a.qty);
 }
 
+/* ============================================================
+   PLAN vs ACTUAL — fetch + parse
+   Fetched via the Apps Script backend (action=getPlanRows), so
+   the plan sheet never needs "anyone with the link" sharing —
+   only normal sharing with whichever Google account the script
+   runs as. Parsing is done by matching HEADER TEXT, not fixed
+   column positions.
+============================================================ */
+function parseCsvText(text) {
+  // minimal CSV parser: handles quoted fields, escaped quotes, commas/newlines inside quotes
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      row.push(field); field = '';
+    } else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      rows.push(row); row = [];
+    } else {
+      field += c;
+    }
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
 async function fetchPlanSheetCsv(sheetId, sheetName) {
-  const url = GOOGLE_SHEET_API_URL + '?action=getPlanRows&sheetId=' + encodeURIComponent(sheetId) + '&tabName=' + encodeURIComponent(sheetName);
+  const url = GOOGLE_SHEET_API_URL + '?action=getPlanRows' +
+    '&sheetId=' + encodeURIComponent(sheetId) + '&tabName=' + encodeURIComponent(sheetName);
   const res = await fetch(url);
   if (!res.ok) throw new Error('Could not reach the backend (HTTP ' + res.status + ').');
   const json = await res.json();
-  if (!json || json.success === false) throw new Error((json && json.error) || 'The backend could not read that plan sheet/tab.');
+  if (!json || json.success === false) {
+    throw new Error((json && json.error) || 'The backend could not read that plan sheet/tab.');
+  }
   return json.rows || [];
 }
 
+// finds the "catch-up" summary table anywhere in the sheet by matching
+// header text (Product / Plan / Actual-or-Transferred / Shortfall /
+// Required-per-day) rather than a fixed row/column position
 function findCatchupHeaderRow(rows) {
   for (let r = 0; r < rows.length; r++) {
     const cells = rows[r].map(c => (c || '').toString().trim().toLowerCase());
@@ -606,7 +789,7 @@ function parsePlanCatchup(rows) {
   for (let r = headerIdx + 1; r < rows.length; r++) {
     const row = rows[r];
     const name = (row[cProduct] || '').toString().trim();
-    if (!name) break;
+    if (!name) break; // blank row ends the table
     const entry = {
       name,
       totalPlan: parseNum(row[cTotalPlan]),
@@ -625,6 +808,18 @@ function parsePlanCatchup(rows) {
   return { rows: out, total };
 }
 
+/* ============================================================
+   PLAN vs ACTUAL — from a photo (OCR)
+   Tesseract reads individual words with their pixel position on
+   the image. Numbers OCR very reliably; header text often doesn't
+   (tight column spacing merges words together), so instead of
+   trying to match header labels, this assumes the catch-up
+   table's column ORDER is always: Product, Total Plan, Plan Till
+   Date, Actual Till Date, Shortfall Till Date, Total Shortfall,
+   Required/day — the same fixed layout every screenshot of this
+   table has — and reconstructs columns from word X-position,
+   the same bucketing idea used for the SAP PDF parser.
+============================================================ */
 function groupWordsIntoRows(words, yThreshold) {
   const sorted = [...words].sort((a, b) => a.y0 - b.y0);
   const rows = [];
@@ -640,6 +835,10 @@ function groupWordsIntoRows(words, yThreshold) {
   return rows.map(r => r.words);
 }
 
+// a product name like "NS 20%" or "ALBR (COLUMBIA CORE)" OCRs as several
+// separate words that sit close together — merge words whose gap is small
+// relative to the text height into one cell, so they land in one column
+// bucket instead of being mistaken for several columns
 function mergeWordsIntoCells(rowWords) {
   if (!rowWords.length) return [];
   const avgHeight = rowWords.reduce((s, w) => s + (w.y1 - w.y0), 0) / rowWords.length;
@@ -710,14 +909,30 @@ function fixedColumnsToEntries(dataRows) {
   return { rows: out, total };
 }
 
-function IconSearch() { return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>; }
-function IconX() { return <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>; }
-function IconUpload() { return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 16V4M12 4l-4 4M12 4l4 4"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>; }
-function IconDownload() { return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 4v12M12 16l-4-4M12 16l4-4"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>; }
-function IconMoon() { return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>; }
-function IconSun() { return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>; }
-function IconPlan() { return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>; }
-function IconGear() { return <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>; }
+function IconSearch() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>;
+}
+function IconX() {
+  return <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>;
+}
+function IconUpload() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 16V4M12 4l-4 4M12 4l4 4"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>;
+}
+function IconDownload() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 4v12M12 16l-4-4M12 16l4-4"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>;
+}
+function IconMoon() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>;
+}
+function IconSun() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>;
+}
+function IconPlan() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>;
+}
+function IconGear() {
+  return <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>;
+}
 
 function Chip({ label, onRemove }) {
   return (
@@ -732,191 +947,6 @@ function Chip({ label, onRemove }) {
         <IconX />
       </button>
     </span>
-  );
-}
-
-function LoadingState() {
-  return (
-    <div style={{ padding: '64px 20px', textAlign: 'center', color: 'var(--ink-2)' }}>
-      <span className="spin" style={{ width: 24, height: 24, border: '3px solid var(--line-strong)', borderTopColor: 'var(--accent)', borderRadius: '50%', display: 'inline-block', marginBottom: 12 }} />
-      <div>Loading data...</div>
-    </div>
-  );
-}
-
-function ErrorState({ message, onRetry }) {
-  return (
-    <div style={{ padding: '48px 20px', textAlign: 'center', color: 'var(--danger)' }}>
-      <div style={{ fontWeight: 600, marginBottom: 8 }}>{message}</div>
-      {onRetry && (
-        <button onClick={onRetry} className="focus-ring" style={{ padding: '8px 16px', borderRadius: 8, border: 'none', background: 'var(--accent)', color: '#fff', fontWeight: 600 }}>
-          Retry
-        </button>
-      )}
-    </div>
-  );
-}
-
-function EmptyState({ title, body, actionLabel, onAction }) {
-  return (
-    <div style={{ padding: '64px 20px', textAlign: 'center', color: 'var(--ink-2)' }}>
-      <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--ink)', marginBottom: 4 }}>{title}</div>
-      <div style={{ fontSize: 13, marginBottom: 16 }}>{body}</div>
-      {actionLabel && onAction && (
-        <button onClick={onAction} className="focus-ring" style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid var(--line-strong)', background: 'var(--surface)', fontWeight: 600 }}>
-          {actionLabel}
-        </button>
-      )}
-    </div>
-  );
-}
-
-function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort, onNameClick }) {
-  return (
-    <div style={{ overflowX: 'auto' }}>
-      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-        <thead>
-          <tr style={{ background: 'var(--surface-2)', borderBottom: '1px solid var(--line)' }}>
-            {cols.map(([key, label, align]) => (
-              <th key={key} onClick={() => onSort(key)} style={{
-                textAlign: align, padding: '12px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', cursor: 'pointer', whiteSpace: 'nowrap'
-              }}>
-                {label} {sortKey === key ? (sortDir === 'asc' ? '↑' : '↓') : ''}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r, i) => (
-            <tr key={i} style={{ borderBottom: '1px solid var(--line)' }}>
-              {cols.map(([key, , align]) => {
-                const isName = key === 'name';
-                const isRate = key === 'rate' || key.endsWith('Rate');
-                const isDate = key === 'date';
-                const isTime = key === 'startTime' || key === 'endTime';
-                const isRunTime = key === 'runTime';
-                let val = r[key];
-
-                if (isDate) val = keyToLabel(val);
-                else if (isTime) val = formatDateTime(val);
-                else if (isRunTime) val = formatRunTime(val);
-                else if (isRate) val = fmtRate(val);
-                else if (typeof val === 'number') val = fmt(val);
-                else val = val || '-';
-
-                return (
-                  <td key={key} style={{ textAlign: align, padding: '10px 14px', whiteSpace: 'nowrap' }}>
-                    {isName ? (
-                      <button onClick={() => onNameClick(r[key])} style={{ background: 'none', border: 'none', padding: 0, color: 'var(--accent)', fontWeight: 600, textAlign: 'left', cursor: 'pointer' }}>
-                        {val}
-                      </button>
-                    ) : val}
-                  </td>
-                );
-              })}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, toDate, metricFields, ariaLabel }) {
-  const canvasRef = useRef(null);
-  const chartInstance = useRef(null);
-
-  useEffect(() => {
-    if (!canvasRef.current) return;
-    const ctx = canvasRef.current.getContext('2d');
-    if (chartInstance.current) chartInstance.current.destroy();
-
-    const dates = Array.from(new Set(allRows.map(r => r.date))).sort();
-    const colors = ['#B54E2E', '#2E7DB5', '#2EB55C', '#9B2EB5', '#B59B2E', '#2EB5B5', '#B52E7D', '#5C2EB5', '#5CB52E', '#B55C2E'];
-
-    const datasets = alloys.map((item, idx) => {
-      const data = dates.map(d => {
-        const matching = allRows.filter(r => r.dept === department && r.date === d && normKey(r[groupField] || '') === normKey(item));
-        const totalQty = matching.reduce((s, r) => s + r.qty, 0);
-        if (!totalQty) return null;
-        if (metricFields) {
-          const cost = matching.reduce((s, r) => s + metricFields.reduce((cs, f) => cs + (r[f] || 0), 0), 0);
-          return cost / totalQty;
-        }
-        const totalCost = matching.reduce((s, r) => s + r.total, 0);
-        return totalCost / totalQty;
-      });
-
-      return {
-        label: item,
-        data,
-        borderColor: colors[idx % colors.length],
-        backgroundColor: colors[idx % colors.length],
-        spanGaps: true,
-        tension: 0.2
-      };
-    });
-
-    chartInstance.current = new Chart(ctx, {
-      type: 'line',
-      data: { labels: dates.map(keyToLabel), datasets },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: { legend: { position: 'bottom' } },
-        scales: { y: { beginAtZero: false, title: { display: true, text: 'Rs / KG' } } }
-      }
-    });
-
-    return () => { if (chartInstance.current) chartInstance.current.destroy(); };
-  }, [allRows, department, alloys, groupField, metricFields]);
-
-  return (
-    <div style={{ height: 260, width: '100%' }}>
-      <canvas ref={canvasRef} aria-label={ariaLabel} />
-    </div>
-  );
-}
-
-function BatchRateBarChart({ rows, metricKey, ariaLabel }) {
-  const canvasRef = useRef(null);
-  const chartInstance = useRef(null);
-
-  useEffect(() => {
-    if (!canvasRef.current) return;
-    const ctx = canvasRef.current.getContext('2d');
-    if (chartInstance.current) chartInstance.current.destroy();
-
-    const topRows = rows.slice(0, 25);
-    const labels = topRows.map(r => r.name);
-    const data = topRows.map(r => metricKey ? r[metricKey] : r.rate);
-
-    chartInstance.current = new Chart(ctx, {
-      type: 'bar',
-      data: {
-        labels,
-        datasets: [{
-          label: 'Rs / KG',
-          data,
-          backgroundColor: '#B54E2E',
-          borderRadius: 4
-        }]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: { legend: { display: false } },
-        scales: { y: { beginAtZero: true, title: { display: true, text: 'Rs / KG' } } }
-      }
-    });
-
-    return () => { if (chartInstance.current) chartInstance.current.destroy(); };
-  }, [rows, metricKey]);
-
-  return (
-    <div style={{ height: 240, width: '100%' }}>
-      <canvas ref={canvasRef} aria-label={ariaLabel} />
-    </div>
   );
 }
 
@@ -982,6 +1012,9 @@ function App() {
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
+  // load the saved Plan-sheet settings (ID + month suffix) once, the first
+  // time the modal is opened — falls back to the hardcoded defaults if
+  // nothing has been saved yet
   useEffect(() => {
     if (!showPlanModal || planSettingsLoaded) return;
     let cancelled = false;
@@ -1026,12 +1059,13 @@ function App() {
               setPlanLoading(false);
               return 'used-manual';
             }
-          } catch (e) {}
+          } catch (e) { /* fall through to live fetch */ }
         }
         return null;
       })
       .then(outcome => {
         if (cancelled || outcome === 'used-manual') return;
+        // no manually-uploaded data saved yet for this tab — try the live fetch
         return fetchPlanSheetCsv(planSheetId, tab.sheetName)
           .then(rows => {
             if (cancelled) return;
@@ -1043,7 +1077,7 @@ function App() {
               setPlanData(parsed);
             }
           })
-          .catch(e => { if (!cancelled) { setPlanError((e.message || 'Could not load the plan sheet.') + ' You can upload a photo of this tab instead.'); setPlanData(null); } })
+          .catch(e => { if (!cancelled) { setPlanError((e.message || 'Could not load the plan sheet.') + ' You can upload a photo of this tab instead — see Upload Photo below.'); setPlanData(null); } })
           .finally(() => { if (!cancelled) setPlanLoading(false); });
       });
 
@@ -1086,7 +1120,8 @@ function App() {
           if (!dates.length) throw new Error('No usable rows found.');
           for (const dk of dates) {
             await setDayRows(dk, byDate[dk]);
-            updatedRows = updatedRows.filter(r => r.date !== dk).concat(byDate[dk].map(r => ({ ...r, date: dk })));
+            updatedRows = updatedRows.filter(r => r.date !== dk)
+              .concat(byDate[dk].map(r => ({ ...r, date: dk })));
             loadedLabels.push(keyToLabel(dk));
           }
         } catch (e) {
@@ -1140,6 +1175,15 @@ function App() {
     });
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]);
   }, [deptRows, selectedMachine]);
+
+  const alloyOptions = useMemo(() => {
+    const totals = {};
+    deptRows.forEach(r => {
+      if (!r.mat) return;
+      totals[r.mat] = (totals[r.mat] || 0) + r.qty;
+    });
+    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]);
+  }, [deptRows]);
 
   const effectiveSelectedBatch = view === 'batch' ? selectedBatch : '';
 
@@ -1800,6 +1844,9 @@ function StatRow({ qty, total, entries, fmt }) {
   );
 }
 
+/* ============================================================
+   PLAN vs ACTUAL MODAL
+============================================================ */
 function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, planTabs, planSheetId, planMonthSuffix, onSaveSettings, planDataSavedAt, onSaveManualData }) {
   const fmt = n => n == null ? '-' : Math.round(n).toLocaleString('en-IN');
   const [showSettings, setShowSettings] = useState(false);
@@ -1809,7 +1856,7 @@ function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, p
   const [ocrLoading, setOcrLoading] = useState(false);
   const [ocrProgress, setOcrProgress] = useState(0);
   const [ocrError, setOcrError] = useState(null);
-  const [reviewRows, setReviewRows] = useState(null);
+  const [reviewRows, setReviewRows] = useState(null); // array of editable entries, or null when not reviewing
   const [reviewTotal, setReviewTotal] = useState(null);
   const photoInputRef = useRef(null);
 
@@ -1838,7 +1885,6 @@ function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, p
       return copy;
     });
   }
-
   function updateReviewTotalCell(field, value) {
     setReviewTotal(prev => ({ ...(prev || { name: 'Total' }), [field]: field === 'name' ? value : parseNum(value) }));
   }
@@ -1849,6 +1895,7 @@ function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, p
     setReviewTotal(null);
   }
 
+  // biggest shortfall first — the rows that need the most catching up
   const sortedRows = useMemo(() => {
     if (!data || !data.rows) return [];
     return [...data.rows].sort((a, b) => (a.requiredPerDay ?? 0) - (b.requiredPerDay ?? 0));
@@ -2005,96 +2052,102 @@ function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, p
               </div>
             </div>
           ) : (
+          <React.Fragment>
+
+          {loading && (
+            <div style={{ padding: '48px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, color: 'var(--ink-2)' }}>
+              <span className="spin" style={{ width: 20, height: 20, border: '2.5px solid var(--line-strong)', borderTopColor: 'var(--accent)', borderRadius: '50%', display: 'inline-block' }} />
+              <span style={{ fontSize: 13 }}>Loading plan data…</span>
+            </div>
+          )}
+
+          {!loading && error && (
+            <div style={{ padding: '32px 20px', textAlign: 'center' }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>Could not load this plan</div>
+              <div style={{ fontSize: 13, color: 'var(--ink-2)' }}>{error}</div>
+            </div>
+          )}
+
+          {!loading && !error && data && (
             <React.Fragment>
-              {loading && (
-                <div style={{ padding: '48px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, color: 'var(--ink-2)' }}>
-                  <span className="spin" style={{ width: 20, height: 20, border: '2.5px solid var(--line-strong)', borderTopColor: 'var(--accent)', borderRadius: '50%', display: 'inline-block' }} />
-                  <span style={{ fontSize: 13 }}>Loading plan data…</span>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, marginBottom: 18 }}>
+                <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 16px' }}>
+                  <div style={{ fontSize: 12, color: 'var(--ink-2)' }}>Total Plan</div>
+                  <div style={{ fontSize: 22, fontWeight: 600, marginTop: 2 }}>{fmt(data.total && data.total.totalPlan)}</div>
                 </div>
-              )}
-
-              {!loading && error && (
-                <div style={{ padding: '32px 20px', textAlign: 'center' }}>
-                  <div style={{ fontWeight: 600, marginBottom: 6 }}>Could not load this plan</div>
-                  <div style={{ fontSize: 13, color: 'var(--ink-2)' }}>{error}</div>
+                <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 16px' }}>
+                  <div style={{ fontSize: 12, color: 'var(--ink-2)' }}>Total Actual</div>
+                  <div style={{ fontSize: 22, fontWeight: 600, marginTop: 2 }}>{fmt(data.total && data.total.actualTillDate)}</div>
                 </div>
-              )}
+                <div style={{ background: 'var(--danger-soft)', border: '1px solid var(--danger)', borderRadius: 10, padding: '14px 16px' }}>
+                  <div style={{ fontSize: 12, color: 'var(--danger)' }}>Total Shortfall</div>
+                  <div style={{ fontSize: 22, fontWeight: 700, marginTop: 2, color: 'var(--danger)' }}>{fmt(data.total && data.total.totalShortfall)}</div>
+                </div>
+                <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 16px' }}>
+                  <div style={{ fontSize: 12, color: 'var(--ink-2)' }}>Achievement</div>
+                  <div style={{ fontSize: 22, fontWeight: 600, marginTop: 2 }}>{achievement != null ? achievement + '%' : '-'}</div>
+                </div>
+              </div>
 
-              {!loading && !error && data && (
-                <React.Fragment>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, marginBottom: 18 }}>
-                    <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 16px' }}>
-                      <div style={{ fontSize: 12, color: 'var(--ink-2)' }}>Total Plan</div>
-                      <div style={{ fontSize: 22, fontWeight: 600, marginTop: 2 }}>{fmt(data.total && data.total.totalPlan)}</div>
-                    </div>
-                    <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 16px' }}>
-                      <div style={{ fontSize: 12, color: 'var(--ink-2)' }}>Total Actual</div>
-                      <div style={{ fontSize: 22, fontWeight: 600, marginTop: 2 }}>{fmt(data.total && data.total.actualTillDate)}</div>
-                    </div>
-                    <div style={{ background: 'var(--danger-soft)', border: '1px solid var(--danger)', borderRadius: 10, padding: '14px 16px' }}>
-                      <div style={{ fontSize: 12, color: 'var(--danger)' }}>Total Shortfall</div>
-                      <div style={{ fontSize: 22, fontWeight: 700, marginTop: 2, color: 'var(--danger)' }}>{fmt(data.total && data.total.totalShortfall)}</div>
-                    </div>
-                    <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 16px' }}>
-                      <div style={{ fontSize: 12, color: 'var(--ink-2)' }}>Achievement</div>
-                      <div style={{ fontSize: 22, fontWeight: 600, marginTop: 2 }}>{achievement != null ? achievement + '%' : '-'}</div>
-                    </div>
-                  </div>
-
-                  <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, overflow: 'hidden' }}>
-                    <div style={{ padding: '14px 20px 2px', fontSize: 13, color: 'var(--ink-2)' }}>
-                      Sorted by biggest catch-up needed first
-                    </div>
-                    <div style={{ overflowX: 'auto' }}>
-                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, marginTop: 8 }}>
-                        <thead>
-                          <tr>
-                            <th style={{ textAlign: 'left', padding: '10px 20px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Product</th>
-                            <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Total Plan</th>
-                            <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Plan Till Date</th>
-                            <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Actual Till Date</th>
-                            <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Shortfall Till Date</th>
-                            <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Total Shortfall</th>
-                            <th style={{ textAlign: 'right', padding: '10px 20px', fontSize: 12, fontWeight: 700, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Required / day</th>
+              <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, overflow: 'hidden' }}>
+                <div style={{ padding: '14px 20px 2px', fontSize: 13, color: 'var(--ink-2)' }}>
+                  Sorted by biggest catch-up needed first
+                </div>
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, marginTop: 8 }}>
+                    <thead>
+                      <tr>
+                        <th style={{ textAlign: 'left', padding: '10px 20px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Product</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Total Plan</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Plan Till Date</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Actual Till Date</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Shortfall Till Date</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Total Shortfall</th>
+                        <th style={{ textAlign: 'right', padding: '10px 20px', fontSize: 12, fontWeight: 700, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Required / day</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sortedRows.map((r, i) => {
+                        const behind = r.shortfallTillDate != null && r.shortfallTillDate < 0;
+                        const reqNeg = r.requiredPerDay != null && r.requiredPerDay < 0;
+                        return (
+                          <tr key={r.name + i}>
+                            <td style={{ padding: '9px 20px', borderBottom: '1px solid var(--line)' }}>{r.name}</td>
+                            <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)' }}>{fmt(r.totalPlan)}</td>
+                            <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)' }}>{fmt(r.planTillDate)}</td>
+                            <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)' }}>{fmt(r.actualTillDate)}</td>
+                            <td style={{
+                              padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)', fontWeight: behind ? 700 : 400,
+                              background: behind ? 'var(--danger-soft)' : 'transparent', color: behind ? 'var(--danger)' : (r.shortfallTillDate > 0 ? '#1E9E6B' : 'inherit')
+                            }}>{fmt(r.shortfallTillDate)}</td>
+                            <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)', color: r.totalShortfall < 0 ? 'var(--danger)' : (r.totalShortfall > 0 ? '#1E9E6B' : 'inherit') }}>{fmt(r.totalShortfall)}</td>
+                            <td style={{ padding: '9px 20px', textAlign: 'right', borderBottom: '1px solid var(--line)', fontWeight: 700, color: reqNeg ? 'var(--danger)' : (r.requiredPerDay > 0 ? '#1E9E6B' : 'inherit') }}>{fmt(r.requiredPerDay)}</td>
                           </tr>
-                        </thead>
-                        <tbody>
-                          {sortedRows.map((r, i) => {
-                            const behind = r.shortfallTillDate != null && r.shortfallTillDate < 0;
-                            const reqNeg = r.requiredPerDay != null && r.requiredPerDay < 0;
-                            return (
-                              <tr key={r.name + i}>
-                                <td style={{ padding: '9px 20px', borderBottom: '1px solid var(--line)' }}>{r.name}</td>
-                                <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)' }}>{fmt(r.totalPlan)}</td>
-                                <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)' }}>{fmt(r.planTillDate)}</td>
-                                <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)' }}>{fmt(r.actualTillDate)}</td>
-                                <td style={{
-                                  padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)', fontWeight: behind ? 700 : 400,
-                                  background: behind ? 'var(--danger-soft)' : 'transparent', color: behind ? 'var(--danger)' : (r.shortfallTillDate > 0 ? '#1E9E6B' : 'inherit')
-                                }}>{fmt(r.shortfallTillDate)}</td>
-                                <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)', color: r.totalShortfall < 0 ? 'var(--danger)' : (r.totalShortfall > 0 ? '#1E9E6B' : 'inherit') }}>{fmt(r.totalShortfall)}</td>
-                                <td style={{ padding: '9px 20px', textAlign: 'right', borderBottom: '1px solid var(--line)', fontWeight: 700, color: reqNeg ? 'var(--danger)' : (r.requiredPerDay > 0 ? '#1E9E6B' : 'inherit') }}>{fmt(r.requiredPerDay)}</td>
-                              </tr>
-                            );
-                          })}
-                          {data.total && (
-                            <tr style={{ background: 'var(--surface-2)', fontWeight: 700 }}>
-                              <td style={{ padding: '11px 20px' }}>Total</td>
-                              <td style={{ padding: '11px 14px', textAlign: 'right' }}>{fmt(data.total.totalPlan)}</td>
-                              <td style={{ padding: '11px 14px', textAlign: 'right' }}>{fmt(data.total.planTillDate)}</td>
-                              <td style={{ padding: '11px 14px', textAlign: 'right' }}>{fmt(data.total.actualTillDate)}</td>
-                              <td style={{ padding: '11px 14px', textAlign: 'right', color: data.total.shortfallTillDate < 0 ? 'var(--danger)' : 'inherit' }}>{fmt(data.total.shortfallTillDate)}</td>
-                              <td style={{ padding: '11px 14px', textAlign: 'right', color: data.total.totalShortfall < 0 ? 'var(--danger)' : 'inherit' }}>{fmt(data.total.totalShortfall)}</td>
-                              <td style={{ padding: '11px 20px', textAlign: 'right', color: data.total.requiredPerDay < 0 ? 'var(--danger)' : 'inherit' }}>{fmt(data.total.requiredPerDay)}</td>
-                            </tr>
-                          )}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                </React.Fragment>
+                        );
+                      })}
+                      {data.total && (
+                        <tr>
+                          <td style={{ padding: '11px 20px', fontWeight: 700 }}>Total</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700 }}>{fmt(data.total.totalPlan)}</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700 }}>{fmt(data.total.planTillDate)}</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700 }}>{fmt(data.total.actualTillDate)}</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700, color: 'var(--danger)' }}>{fmt(data.total.shortfallTillDate)}</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700, color: 'var(--danger)' }}>{fmt(data.total.totalShortfall)}</td>
+                          <td style={{ padding: '11px 20px', textAlign: 'right', fontWeight: 700, color: 'var(--danger)' }}>{fmt(data.total.requiredPerDay)}</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              {planDataSavedAt && (
+                <div style={{ fontSize: 11.5, color: 'var(--ink-3)', marginTop: 8 }}>
+                  From an uploaded photo, saved {new Date(planDataSavedAt).toLocaleString('en-IN')}.
+                </div>
               )}
             </React.Fragment>
+          )}
+          </React.Fragment>
           )}
         </div>
       </div>
@@ -2102,8 +2155,380 @@ function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, p
   );
 }
 
-const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(<App />);
+function MultiValueCell({ value }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!value || value === '-' || !value.includes(', ')) {
+    return <span className="mono">{value}</span>;
+  }
+  const parts = value.split(', ');
+  if (!expanded) {
+    return (
+      <span onClick={() => setExpanded(true)} className="mono focus-ring" tabIndex={0}
+        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(true); } }}
+        role="button" aria-expanded="false" aria-label={'Show all ' + parts.length + ' material codes'}
+        style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+        {parts[0]}
+        <span style={{
+          fontSize: 11, fontWeight: 600, color: 'var(--accent)', background: 'var(--accent-soft)',
+          padding: '1px 7px', borderRadius: 999, flexShrink: 0
+        }}>+{parts.length - 1}</span>
+      </span>
+    );
+  }
+  return (
+    <span onClick={() => setExpanded(false)} className="focus-ring" tabIndex={0}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(false); } }}
+      role="button" aria-expanded="true" aria-label="Collapse material codes"
+      style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 4, cursor: 'pointer', maxWidth: 280 }}>
+      {parts.map((p, i) => (
+        <span key={i} className="mono" style={{
+          fontSize: 12, background: 'var(--surface-2)', padding: '2px 8px', borderRadius: 6, border: '1px solid var(--line)'
+        }}>{p}</span>
+      ))}
+    </span>
+  );
+}
+
+const TREND_LINE_COLORS = ['#B54E2E', '#2E6FBF', '#1E9E6B', '#D9A400', '#C0568A', '#6B4FBF', '#2AA198', '#C4453A', '#7A8B3F', '#8B5A2B'];
+
+function buildAlloyTrendData(allRows, department, groupValues, groupField, fromDate, toDate, metricFields) {
+  groupField = groupField || 'mat';
+  metricFields = metricFields || ['total'];
+  if (!allRows || !groupValues.length) return { dates: [], rateDatasets: [], qtyDatasets: [], totalQtyByDate: {} };
+  const canonicalByNormKey = {};
+  groupValues.forEach(v => { canonicalByNormKey[normKey(v)] = v; });
+  const dateSet = new Set();
+  const byGroupDate = {};
+  const totalQtyByDate = {};
+  allRows.forEach(r => {
+    if (r.dept !== department) return;
+    if (fromDate && r.date < fromDate) return;
+    if (toDate && r.date > toDate) return;
+    totalQtyByDate[r.date] = (totalQtyByDate[r.date] || 0) + r.qty;
+    const canonical = canonicalByNormKey[normKey(r[groupField])];
+    if (!canonical) return;
+    dateSet.add(r.date);
+    const key = canonical + '||' + r.date;
+    if (!byGroupDate[key]) byGroupDate[key] = { qty: 0, total: 0 };
+    byGroupDate[key].qty += r.qty;
+    byGroupDate[key].total += metricFields.reduce((sum, f) => sum + (r[f] || 0), 0);
+  });
+  const dates = Array.from(dateSet).sort();
+  const rateDatasets = groupValues.map((val, i) => ({
+    label: val,
+    data: dates.map(d => {
+      const b = byGroupDate[val + '||' + d];
+      return b && b.qty ? b.total / b.qty : null;
+    }),
+    qty: dates.map(d => {
+      const b = byGroupDate[val + '||' + d];
+      return b ? b.qty : null;
+    }),
+    borderColor: TREND_LINE_COLORS[i % TREND_LINE_COLORS.length],
+    backgroundColor: TREND_LINE_COLORS[i % TREND_LINE_COLORS.length],
+    fill: false, tension: 0.3, pointRadius: 4, spanGaps: true
+  }));
+  const qtyDatasets = groupValues.map((val, i) => ({
+    label: val,
+    data: dates.map(d => {
+      const b = byGroupDate[val + '||' + d];
+      return b ? b.qty : null;
+    }),
+    borderColor: TREND_LINE_COLORS[i % TREND_LINE_COLORS.length],
+    backgroundColor: TREND_LINE_COLORS[i % TREND_LINE_COLORS.length],
+    fill: false, tension: 0.3, pointRadius: 4, spanGaps: true
+  }));
+  return { dates, rateDatasets, qtyDatasets, totalQtyByDate };
+}
+
+function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, toDate, ariaLabel, metricFields, yAxisLabel }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+
+  const { dates, rateDatasets, totalQtyByDate } = useMemo(
+    () => buildAlloyTrendData(allRows, department, alloys, groupField, fromDate, toDate, metricFields),
+    [allRows, department, alloys, groupField, fromDate, toDate, metricFields]
+  );
+
+  useEffect(() => {
+    if (!canvasRef.current || typeof Chart === 'undefined') return;
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'line',
+      data: { labels: dates.map(keyToLabel), datasets: rateDatasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true, position: 'bottom', labels: { boxWidth: 12, boxHeight: 12, font: { size: 11 } } },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => {
+                const rate = ctx.parsed.y;
+                const rateText = rate != null ? rate.toFixed(2) + ' Rs/kg' : 'no data';
+                return ctx.dataset.label + ': ' + rateText;
+              },
+              footer: (items) => {
+                if (!items.length) return '';
+                const item = items[0];
+                const qty = item.dataset.qty ? item.dataset.qty[item.dataIndex] : null;
+                return 'Total production: ' + (qty != null ? Math.round(qty).toLocaleString('en-IN') : '0') + ' kg';
+              }
+            }
+          }
+        },
+        scales: {
+          x: { ticks: { autoSkip: false, maxRotation: 45 }, grid: { display: false } },
+          y: { title: { display: true, text: yAxisLabel || 'Rs / kg' }, grid: { color: '#E7E2D8' }, beginAtZero: true }
+        }
+      }
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [dates, rateDatasets, totalQtyByDate]);
+
+  if (!rateDatasets.length) {
+    return <div style={{ fontSize: 13, color: 'var(--ink-2)', padding: '12px 0' }}>No trend data yet.</div>;
+  }
+
+  return (
+    <div>
+      {dates.length <= 1 && (
+        <div style={{ fontSize: 12, color: 'var(--ink-3)', marginBottom: 6 }}>
+          Only one date selected — widen the From/To range above to see a trend line instead of single points.
+        </div>
+      )}
+      <div style={{ position: 'relative', height: 280 }}>
+        <canvas ref={canvasRef} role="img" aria-label={ariaLabel || "Line chart of Rs per kg cost over time. Hover a point to see quantity."}></canvas>
+      </div>
+    </div>
+  );
+}
+
+function BatchRateBarChart({ rows, metricKey, yAxisLabel, ariaLabel }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+  const key = metricKey || 'rate';
+  const capped = useMemo(() => rows.slice(0, 25), [rows]);
+
+  useEffect(() => {
+    if (!canvasRef.current || typeof Chart === 'undefined') return;
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'bar',
+      data: {
+        labels: capped.map(r => r.name),
+        datasets: [{
+          data: capped.map(r => r[key]),
+          backgroundColor: '#B54E2E',
+          borderRadius: 4,
+          barThickness: 20
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: ctx => ctx.parsed.y.toFixed(2) + ' Rs/kg',
+              afterLabel: ctx => Math.round(capped[ctx.dataIndex].qty).toLocaleString('en-IN') + ' kg'
+            }
+          }
+        },
+        scales: {
+          x: { grid: { display: false }, ticks: { font: { size: 11 }, maxRotation: 45, autoSkip: false } },
+          y: { title: { display: true, text: yAxisLabel || 'Rs / kg' }, beginAtZero: true, grid: { color: '#E7E2D8' } }
+        }
+      }
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [capped, key]);
+
+  if (!capped.length) {
+    return <div style={{ fontSize: 13, color: 'var(--ink-2)', padding: '12px 0' }}>No batch data yet.</div>;
+  }
+
+  return (
+    <div style={{ position: 'relative', height: 320 }}>
+      <canvas ref={canvasRef} role="img" aria-label={ariaLabel || "Bar chart of Rs per kg cost, one bar per batch. Batch numbers on the X axis, Rs per kg on the Y axis."}></canvas>
+    </div>
+  );
+}
+
+function BatchCostChart({ rows, title }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+
+  useEffect(() => {
+    if (!canvasRef.current || typeof Chart === 'undefined') return;
+    const labels = rows.map(r => r.name);
+    const data = rows.map(r => r.rate);
+
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Rs/kg',
+          data,
+          borderColor: '#B54E2E',
+          backgroundColor: 'rgba(181,78,46,0.1)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: rows.length > 30 ? 0 : 3,
+          pointBackgroundColor: '#B54E2E',
+          pointHoverRadius: 5
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { autoSkip: rows.length > 25, maxRotation: 45, font: { size: 10 } }, grid: { display: false } },
+          y: { title: { display: true, text: 'Rs / kg' }, grid: { color: '#E7E2D8' } }
+        }
+      }
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [rows]);
+
+  return (
+    <div style={{
+      background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+      padding: '16px 16px 8px', marginBottom: 16
+    }}>
+      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8, color: 'var(--ink-2)' }}>{title}</div>
+      <div style={{ position: 'relative', height: 240 }}>
+        <canvas ref={canvasRef} role="img" aria-label={title + ' — line chart.'}></canvas>
+      </div>
+    </div>
+  );
+}
+
+function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort, onNameClick }) {
+  return (
+    <div style={{ overflowX: 'auto' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+        <thead>
+          <tr>
+            {cols.map(([key, label, align]) => {
+              const isActive = sortKey === key;
+              return (
+                <th key={key} onClick={() => onSort && onSort(key)} style={{
+                  textAlign: align, padding: '10px 14px', fontSize: 12, fontWeight: 600,
+                  color: isActive ? 'var(--accent)' : 'var(--ink-2)', borderBottom: '1px solid var(--line)', whiteSpace: 'nowrap',
+                  position: 'sticky', top: 0, background: 'var(--surface)', zIndex: 2,
+                  cursor: onSort ? 'pointer' : 'default', userSelect: 'none'
+                }}>
+                  {label}{isActive ? (sortDir === 'asc' ? ' \u2191' : ' \u2193') : ''}
+                </th>
+              );
+            })}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={r.name + i} style={{ transition: 'background 0.1s' }}
+              onMouseEnter={e => e.currentTarget.style.background = 'var(--surface-2)'}
+              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+              {cols.map(([key, , align]) => {
+                const isName = key === 'name';
+                const isMono = isName && view === 'batch';
+                const isRateCol = key === 'rate' || key.endsWith('Rate');
+                const isTextCol = key === 'name' || key === 'wc' || key === 'material' || key === 'matCode';
+                const isDateCol = key === 'date';
+                const isTimeCol = key === 'startTime' || key === 'endTime';
+                const isRunTimeCol = key === 'runTime';
+                let val;
+                if (isDateCol) val = keyToLabel(r[key]);
+                else if (isTimeCol) val = formatDateTime(r[key]);
+                else if (isRunTimeCol) val = formatRunTime(r[key]);
+                else if (isRateCol) val = fmtRate(r[key]);
+                else if (isTextCol) val = r[key] || '-';
+                else val = fmt(r[key]);
+
+                const isMultiValueCol = key === 'matCode' || key === 'material';
+                const cellContent = isMultiValueCol
+                  ? <MultiValueCell value={val} />
+                  : isName
+                    ? (
+                        <span
+                          onClick={() => onNameClick && onNameClick(r.name)}
+                          className="focus-ring"
+                          title={'Click to filter everything to ' + r.name}
+                          style={{ cursor: onNameClick ? 'pointer' : 'default', color: onNameClick ? 'var(--accent)' : 'inherit', textDecoration: 'none' }}
+                          onMouseEnter={e => { if (onNameClick) e.currentTarget.style.textDecoration = 'underline'; }}
+                          onMouseLeave={e => { e.currentTarget.style.textDecoration = 'none'; }}
+                        >
+                          {val}
+                        </span>
+                      )
+                    : val;
+
+                return (
+                  <td key={key} className={isMono ? 'mono' : ''} style={{
+                    padding: '9px 14px', textAlign: align, borderBottom: '1px solid var(--line)',
+                    whiteSpace: 'nowrap',
+                    fontWeight: key === 'rate' ? 600 : 400
+                  }}>{cellContent}</td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function LoadingState() {
+  return (
+    <div style={{ padding: '64px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, color: 'var(--ink-2)' }}>
+      <span className="spin" style={{ width: 22, height: 22, border: '2.5px solid var(--line-strong)', borderTopColor: 'var(--accent)', borderRadius: '50%', display: 'inline-block' }} />
+      <span style={{ fontSize: 13 }}>Loading data…</span>
+    </div>
+  );
+}
+function ErrorState({ message, onRetry }) {
+  return (
+    <div style={{ padding: '56px 20px', textAlign: 'center' }}>
+      <div style={{ fontWeight: 600, marginBottom: 6 }}>Something went wrong</div>
+      <div style={{ fontSize: 13, color: 'var(--ink-2)', marginBottom: 16 }}>{message}</div>
+      <button onClick={onRetry} className="focus-ring" style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid var(--line-strong)', background: 'var(--surface)', fontWeight: 600, fontSize: 13 }}>
+        Retry
+      </button>
+    </div>
+  );
+}
+function EmptyState({ title, body, actionLabel, onAction }) {
+  return (
+    <div style={{ padding: '56px 20px', textAlign: 'center' }}>
+      <div style={{ fontWeight: 600, marginBottom: 6 }}>{title}</div>
+      <div style={{ fontSize: 13, color: 'var(--ink-2)', marginBottom: actionLabel ? 16 : 0, maxWidth: 340, margin: '0 auto 16px' }}>{body}</div>
+      {actionLabel && (
+        <button onClick={onAction} className="focus-ring" style={{ padding: '8px 16px', borderRadius: 8, border: 'none', background: 'var(--accent)', color: 'var(--accent-ink)', fontWeight: 600, fontSize: 13 }}>
+          {actionLabel}
+        </button>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+
+<script>
+(function() {
+  const src = document.getElementById('app-source').textContent;
+  const compiled = Babel.transform(src, { presets: [['react', { runtime: 'classic' }]] }).code;
+  const script = document.createElement('script');
+  script.textContent = compiled;
+  document.body.appendChild(script);
+})();
 </script>
 </body>
 </html>
