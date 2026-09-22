@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Batchwise Tracker</title>
+<link rel="preconnect" href="https://firestore.googleapis.com" crossorigin>
+<link rel="dns-prefetch" href="https://firestore.googleapis.com">
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23B54E2E'/%3E%3Ctext x='16' y='23' font-family='Arial, Helvetica, sans-serif' font-size='19' font-weight='700' fill='white' text-anchor='middle'%3EB%3C/text%3E%3C/svg%3E">
 <style>
   :root {
@@ -715,26 +717,30 @@ async function fetchPlanSheetCsv(sheetId, sheetName) {
   return json.rows || [];
 }
 
-// finds the "catch-up" summary table anywhere in the sheet by matching
-// header text (Product / Plan / Actual-or-Transferred / Shortfall /
-// Required-per-day) rather than a fixed row/column position
+// Finds the "catch-up" summary table by locating a "Product" header
+// cell. The 6 columns after it are ALWAYS, in every department's tab,
+// in this exact order: Total <X>, <X> Plan Till Date, <X actual> Till
+// Date, Shortfall Till Date, Total Shortfall, <X> Required/day — but
+// the <X> wording differs per department (CCP says "Casting"/"Casted",
+// Coil says "Transfer"/"Transfered", FG says "Packing"/"Packed", and FG's
+// first column is even labelled "Packing Target" instead of "Total ...").
+// So column identity comes from POSITION relative to "Product", not from
+// matching those varying words — only "Shortfall" (always 4 columns
+// after Product) and "Required" (always 6 columns after) are checked,
+// as a sanity check that this is really the right table.
 function findCatchupHeaderRow(rows) {
   for (let r = 0; r < rows.length; r++) {
     const cells = rows[r].map(c => (c || '').toString().trim().toLowerCase());
-    const hasProduct = cells.some(c => c === 'product');
-    const hasPlan = cells.some(c => c.includes('plan'));
-    const hasActual = cells.some(c => c.includes('actual') || c.includes('transfer'));
-    const hasShortfall = cells.some(c => c.includes('shortfall'));
-    if (hasProduct && hasPlan && hasActual && hasShortfall) return r;
+    for (let c = 0; c < cells.length; c++) {
+      if (cells[c] !== 'product') continue;
+      const shortfallTillCell = cells[c + 4] || '';
+      const requiredCell = cells[c + 6] || '';
+      if (shortfallTillCell.includes('shortfall') && requiredCell.includes('required')) {
+        return { row: r, col: c };
+      }
+    }
   }
-  return -1;
-}
-
-function colIndexMatching(headerCells, predicate) {
-  for (let i = 0; i < headerCells.length; i++) {
-    if (predicate(headerCells[i])) return i;
-  }
-  return -1;
+  return null;
 }
 
 function parseNum(v) {
@@ -744,19 +750,16 @@ function parseNum(v) {
 }
 
 function parsePlanCatchup(rows) {
-  const headerIdx = findCatchupHeaderRow(rows);
-  if (headerIdx === -1) return { rows: [], total: null };
+  const header = findCatchupHeaderRow(rows);
+  if (!header) return { rows: [], total: null };
 
-  const header = rows[headerIdx].map(c => (c || '').toString().trim().toLowerCase());
-  const cProduct = colIndexMatching(header, c => c === 'product');
-  const cTotalPlan = colIndexMatching(header, c => c.includes('total') && c.includes('plan'));
-  const cPlanTillDate = colIndexMatching(header, c => c.includes('plan') && c.includes('till'));
-  const cActualTillDate = colIndexMatching(header, c => (c.includes('transfer') || c.includes('actual')) && c.includes('till'));
-  const cShortfallTillDate = colIndexMatching(header, c => c.includes('shortfall') && c.includes('till'));
-  const cTotalShortfall = colIndexMatching(header, c => c.includes('total') && c.includes('shortfall'));
-  const cRequiredPerDay = colIndexMatching(header, c => c.includes('required'));
-
-  if (cProduct === -1) return { rows: [], total: null };
+  const { row: headerIdx, col: cProduct } = header;
+  const cTotalPlan = cProduct + 1;
+  const cPlanTillDate = cProduct + 2;
+  const cActualTillDate = cProduct + 3;
+  const cShortfallTillDate = cProduct + 4;
+  const cTotalShortfall = cProduct + 5;
+  const cRequiredPerDay = cProduct + 6;
 
   const out = [];
   let total = null;
