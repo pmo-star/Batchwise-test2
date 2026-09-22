@@ -301,32 +301,47 @@ const LOCAL_CACHE_KEY = 'bwt_cache_rows_v1';
 
 // ONE paginated list call for the whole collection instead of one
 // request per date — stays fast even as the number of dates grows.
-async function getAllRowsRemote() {
-  // 1. Pehle LocalStorage se cached data instant read karein
-  const localData = localStorage.getItem(LOCAL_CACHE_KEY);
-  let localCache = {};
-  if (localData) {
-    try {
-      localCache = JSON.parse(localData) || {};
-    } catch (e) {
-      console.warn('LocalStorage cache parse failed', e);
-    }
-  }
+async function getAllRowsRemote(onProgress) {
+  const timing = {
+    localReadMs: 0,
+    firestoreMs: 0,
+    parseCacheMs: 0,
+    totalMs: 0,
+    docs: 0,
+    rows: 0
+  };
+  const startedAt = performance.now();
 
-  // App memory cache me store karein taaki screen turant load ho sake
+  // 1. Read LocalStorage first. If the cache is too large/corrupt,
+  // continue normally instead of blocking the Firestore load.
+  const localStart = performance.now();
+  let localCache = {};
+  try {
+    const localData = localStorage.getItem(LOCAL_CACHE_KEY);
+    if (localData) localCache = JSON.parse(localData) || {};
+  } catch (e) {
+    console.warn('LocalStorage cache read failed', e);
+  }
   for (const dateKey in localCache) {
     cache['rows:' + dateKey] = localCache[dateKey];
   }
+  timing.localReadMs = performance.now() - localStart;
+  if (onProgress) onProgress({ phase: 'local', timing: { ...timing } });
 
-  // 2. Firestore se payload fetch karein
+  // 2. Fetch the complete Firestore collection once.
+  const firestoreStart = performance.now();
   const docs = await firestoreListCollection('batchRows');
+  timing.firestoreMs = performance.now() - firestoreStart;
+  timing.docs = docs.length;
+  if (onProgress) onProgress({ phase: 'firestore', timing: { ...timing } });
+
+  // 3. Parse payloads and update the in-memory cache.
+  const parseStart = performance.now();
   const all = [];
   const updatedLocalCache = {};
 
   docs.forEach(({ id, data }) => {
     let rowsArr = [];
-
-    // Naye Stringified Payload ko parse karein
     if (data && data.payload) {
       try {
         rowsArr = JSON.parse(data.payload);
@@ -334,26 +349,52 @@ async function getAllRowsRemote() {
         console.error('Parsing error on date:', id, e);
       }
     } else if (data && data.rows) {
-      // Purane format wale data ke liye backward compatibility fallback
+      // Backward compatibility with the old Firestore format.
       rowsArr = data.rows;
     }
 
     cache['rows:' + id] = rowsArr;
     updatedLocalCache[id] = rowsArr;
-
     rowsArr.forEach(r => all.push({ ...r, date: id }));
   });
 
-  // 3. Agli baar ke liye LocalStorage me store kar dein
+  timing.parseCacheMs = performance.now() - parseStart;
+  timing.rows = all.length;
+
+  // 4. LocalStorage is only a speed cache. It must never break the app
+  // when the dataset is larger than the browser's storage quota.
+  // Keep the newest dates that fit instead of attempting one huge write.
   try {
-    localStorage.setItem(LOCAL_CACHE_KEY, JSON.stringify(updatedLocalCache));
+    const entries = Object.entries(updatedLocalCache)
+      .sort((a, b) => String(b[0]).localeCompare(String(a[0])));
+    const cacheToStore = {};
+    const targetBytes = 3.5 * 1024 * 1024; // stay comfortably below common ~5 MB quotas
+
+    for (const [dateKey, rowsArr] of entries) {
+      cacheToStore[dateKey] = rowsArr;
+      try {
+        const size = JSON.stringify(cacheToStore).length;
+        if (size > targetBytes) {
+          delete cacheToStore[dateKey];
+          break;
+        }
+      } catch (e) {
+        delete cacheToStore[dateKey];
+        break;
+      }
+    }
+
+    localStorage.setItem(LOCAL_CACHE_KEY, JSON.stringify(cacheToStore));
   } catch (e) {
-    console.warn('LocalStorage limit exceeded', e);
+    // Quota/storage errors are non-fatal because Firestore is the source of truth.
+    console.warn('LocalStorage cache skipped (quota/storage limit):', e);
   }
+
+  timing.totalMs = performance.now() - startedAt;
+  if (onProgress) onProgress({ phase: 'done', timing: { ...timing } });
 
   return all;
 }
-
 
 function normalizeHeader(h) {
   return String(h == null ? '' : h)
