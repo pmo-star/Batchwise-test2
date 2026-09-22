@@ -86,6 +86,8 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
 
 <script type="text/babel-jsx" id="app-source">
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
@@ -98,6 +100,25 @@ if (typeof pdfjsLib !== 'undefined') {
    CONFIG
 ============================================================ */
 const GOOGLE_SHEET_API_URL = 'https://script.google.com/macros/s/AKfycbzkfY8LRSrbi7gsWXYjXYnu_h5C31uPJibO2Nm7sDuNtF493GhTuI8JAj4uAVL5gUvh/exec';
+
+/* ============================================================
+   FIREBASE (replaces the old Google-Sheet-via-Apps-Script
+   transport for the tracker's own batch data + settings meta).
+   The Apps Script backend above is still used for ONE thing:
+   reading the separate monthly "Plan vs Actual" Google Sheet
+   (fetchPlanSheetCsv / action=getPlanRows), since Firestore can't
+   read a Google Sheet directly.
+============================================================ */
+const firebaseConfig = {
+  apiKey: "AIzaSyDX1AunKy4e5QOTmvEiKCJv9K9SxSUFhxs",
+  authDomain: "batchwise-trends.firebaseapp.com",
+  projectId: "batchwise-trends",
+  storageBucket: "batchwise-trends.firebasestorage.app",
+  messagingSenderId: "860012761430",
+  appId: "1:860012761430:web:fd594b857ed13f167e06f7"
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
 
 const GROUP_MAP = {
   ZCCP: 'CCP', ZMILL: 'CCP', ZPULV: 'CCP', ZCH01: 'CCP',
@@ -142,23 +163,29 @@ function extractSheetId(input) {
   return null;
 }
 
+/* ============================================================
+   FIRESTORE TRANSPORT LAYER
+   One document per date in the "batchRows" collection (its
+   content is the array of that date's rows) — this keeps reads
+   cheap even as data grows across years, because loading a date
+   range costs one document read per date, not one per row.
+   A single "meta/v3-date-index" document holds the list of dates
+   that have data, so the app never has to scan the whole
+   collection just to know which dates exist.
+============================================================ */
 const cache = {};
+
 async function sheetGetMeta(key) {
   const cacheKey = 'meta:' + key;
   if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) return cache[cacheKey];
-  const res = await fetch(GOOGLE_SHEET_API_URL + '?key=' + encodeURIComponent(key));
-  const json = await res.json();
-  const val = json && json.value !== undefined ? json.value : null;
+  const snap = await db.collection('meta').doc(key).get();
+  const val = snap.exists && snap.data().value !== undefined ? snap.data().value : null;
   cache[cacheKey] = val;
   return val;
 }
 async function sheetSetMeta(key, value) {
   cache['meta:' + key] = value;
-  await fetch(GOOGLE_SHEET_API_URL, {
-    method: 'POST',
-    mode: 'no-cors',
-    body: JSON.stringify({ action: 'set', key, value })
-  });
+  await db.collection('meta').doc(key).set({ value });
 }
 async function getDateIndex() {
   const raw = await sheetGetMeta('v3-date-index');
@@ -166,28 +193,41 @@ async function getDateIndex() {
 }
 async function setDateIndex(list) { await sheetSetMeta('v3-date-index', JSON.stringify(list)); }
 
-async function getAllRowsRemote() {
-  const res = await fetch(GOOGLE_SHEET_API_URL + '?action=getAllRows');
-  const json = await res.json();
-  return (json && json.rows) || [];
-}
-
 async function getDayRows(dateKey) {
   const cacheKey = 'rows:' + dateKey;
   if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) return cache[cacheKey];
-  const res = await fetch(GOOGLE_SHEET_API_URL + '?action=getRows&date=' + encodeURIComponent(dateKey));
-  const json = await res.json();
-  const rows = (json && json.rows) || [];
+  const snap = await db.collection('batchRows').doc(dateKey).get();
+  const rows = snap.exists && snap.data().rows ? snap.data().rows : [];
   cache[cacheKey] = rows;
   return rows;
 }
 async function setDayRows(dateKey, rows) {
   cache['rows:' + dateKey] = rows;
-  await fetch(GOOGLE_SHEET_API_URL, {
-    method: 'POST',
-    mode: 'no-cors',
-    body: JSON.stringify({ action: 'setRows', date: dateKey, rows })
+  if (!rows || !rows.length) {
+    await db.collection('batchRows').doc(dateKey).delete();
+  } else {
+    await db.collection('batchRows').doc(dateKey).set({ rows, updatedAt: Date.now() });
+  }
+  const idx = await getDateIndex();
+  const has = idx.includes(dateKey);
+  if ((!rows || !rows.length) && has) {
+    delete cache['meta:v3-date-index'];
+    await setDateIndex(idx.filter(d => d !== dateKey));
+  } else if (rows && rows.length && !has) {
+    idx.push(dateKey);
+    delete cache['meta:v3-date-index'];
+    await setDateIndex(idx);
+  }
+}
+
+async function getAllRowsRemote() {
+  const dates = await getDateIndex();
+  const perDate = await Promise.all(dates.map(d => getDayRows(d)));
+  const all = [];
+  dates.forEach((d, i) => {
+    (perDate[i] || []).forEach(r => all.push({ ...r, date: d }));
   });
+  return all;
 }
 
 function normalizeHeader(h) {
@@ -529,12 +569,11 @@ function aggregateBy(rows, keyFn, nameFn) {
 
 /* ============================================================
    PLAN vs ACTUAL — fetch + parse
-   Fetched as CSV via Google's gviz endpoint (no API key needed;
-   the sheet just needs to be viewable by anyone with the link).
-   Parsing is done by matching HEADER TEXT, not fixed column
-   positions — the planning sheet's exact column layout can shift
-   without breaking this, the same way the SAP file parser looks
-   up columns by name instead of position.
+   Fetched via the Apps Script backend (action=getPlanRows), so
+   the plan sheet never needs "anyone with the link" sharing —
+   only normal sharing with whichever Google account the script
+   runs as. Parsing is done by matching HEADER TEXT, not fixed
+   column positions.
 ============================================================ */
 function parseCsvText(text) {
   // minimal CSV parser: handles quoted fields, escaped quotes, commas/newlines inside quotes
@@ -566,10 +605,6 @@ function parseCsvText(text) {
 }
 
 async function fetchPlanSheetCsv(sheetId, sheetName) {
-  // Goes through our own Apps Script backend (same account that already
-  // manages the batch-tracking Sheet) instead of Google's public gviz CSV
-  // export — this way the plan sheet never needs "anyone with the link"
-  // sharing, only normal sharing with whichever account the script runs as.
   const url = GOOGLE_SHEET_API_URL + '?action=getPlanRows' +
     '&sheetId=' + encodeURIComponent(sheetId) + '&tabName=' + encodeURIComponent(sheetName);
   const res = await fetch(url);
@@ -720,22 +755,14 @@ async function extractPlanTableFromImage(file, onProgress) {
   const rows = groupWordsIntoRows(words, 14).map(mergeWordsIntoCells);
   if (rows.length < 2) throw new Error('Could not detect a table (need a header row plus at least one data row).');
 
-  // the DATA row with the most cells is the safest source for column
-  // x-positions — a sparser row (e.g. a zero-filled product) might be
-  // missing a value and understate the true column count. The header
-  // row is deliberately excluded here: labels like "Plan Till Date"
-  // split into several words each, which would overcount columns.
   const dataRowCandidates = rows.slice(1);
   let refRow = dataRowCandidates[0];
   dataRowCandidates.forEach(r => { if (r.length > refRow.length) refRow = r; });
   const boundaries = refRow.map(c => c.x0);
 
-  // skip row 0 (the header) — column identity comes from fixed order, not header text
   return dataRowCandidates.map(r => bucketRowByColumns(r, boundaries));
 }
 
-// dataRows: array of string arrays, fixed column order —
-// [Product, Total Plan, Plan Till Date, Actual Till Date, Shortfall Till Date, Total Shortfall, Required/day]
 function fixedColumnsToEntries(dataRows) {
   const out = [];
   let total = null;
@@ -1030,11 +1057,6 @@ function App() {
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]);
   }, [deptRows]);
 
-  // the Batch filter only makes sense while actually viewing the Batch tab
-  // — this is the one value used everywhere a "does the batch filter apply
-  // right now" check is needed, so switching to Machine wise/Alloy always
-  // behaves as if no batch were selected (search/stats/charts included),
-  // without losing the choice for whenever the user returns to Batch.
   const effectiveSelectedBatch = view === 'batch' ? selectedBatch : '';
 
   const searchedAllRows = useMemo(() => {
@@ -1163,11 +1185,6 @@ function App() {
     else { setSortKey(key); setSortDir('desc'); }
   }
 
-  // clicking a row's name should reuse the SAME filter the dropdowns use,
-  // not a separate free-text search — otherwise "Machine: X" (from the
-  // dropdown) and "Search: X" (from clicking the same machine's name in
-  // the table) show up as two redundant chips for one filter, and clearing
-  // one leaves the other still narrowing the data.
   function handleNameClick(name) {
     if (view === 'wc') setSelectedMachine(name);
     else if (view === 'batch') setSelectedBatch(name);
