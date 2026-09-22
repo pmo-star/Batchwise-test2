@@ -847,6 +847,7 @@ function App() {
   const [planSettingsLoaded, setPlanSettingsLoaded] = useState(false);
   const [planDataSavedAt, setPlanDataSavedAt] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [loadElapsedMs, setLoadElapsedMs] = useState(null);
   const [error, setError] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [toast, setToast] = useState(null);
@@ -868,13 +869,15 @@ function App() {
   }, [allRows]);
 
   const loadAll = useCallback(async () => {
-    setLoading(true); setError(null);
+    setLoading(true); setError(null); setLoadElapsedMs(null);
+    const startedAt = performance.now();
     try {
       const rows = await getAllRowsRemote();
       setAllRows(rows);
       const dates = Array.from(new Set(rows.map(r => r.date))).sort().reverse();
       setFromDate(prev => (prev && dates.includes(prev)) ? prev : (dates[0] || null));
       setToDate(prev => (prev && dates.includes(prev)) ? prev : (dates[0] || null));
+      setLoadElapsedMs(performance.now() - startedAt);
     } catch (e) {
       setError('Could not reach the data source. Check your connection and try again.');
     } finally {
@@ -1281,6 +1284,7 @@ function App() {
         uploading={uploading}
         uploadProgress={uploadProgress}
         onOpenPlan={() => setShowPlanModal(true)}
+        loadElapsedMs={loadElapsedMs}
       />
       <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.pdf" multiple style={{ display: 'none' }}
         onChange={e => { if (e.target.files.length) handleFiles(e.target.files); e.target.value = ''; }} />
@@ -1448,7 +1452,7 @@ function App() {
   );
 }
 
-function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, canExport, uploading, uploadProgress, onOpenPlan }) {
+function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, canExport, uploading, uploadProgress, onOpenPlan, loadElapsedMs }) {
   return (
     <header style={{ borderBottom: '1px solid var(--line)', background: 'var(--surface)', position: 'sticky', top: 0, zIndex: 10 }}>
       <div className="topbar-row" style={{ maxWidth: 1650, margin: '0 auto', padding: '14px 24px', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
@@ -1511,9 +1515,18 @@ function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, c
       </div>
       <div style={{
         maxWidth: 1650, margin: '0 auto', padding: '0 24px 10px',
-        fontSize: 12, color: 'var(--ink-2)', textAlign: 'right'
+        fontSize: 12, color: 'var(--ink-2)', textAlign: 'right',
+        display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10
       }}>
-        Only upload the <strong>&ldquo;Batch Wise Cost&rdquo;</strong> sheet — work center, alloy, and batch views are generated automatically from it.
+        <span>Only upload the <strong>&ldquo;Batch Wise Cost&rdquo;</strong> sheet — work center, alloy, and batch views are generated automatically from it.</span>
+        {loadElapsedMs != null && (
+          <span style={{
+            flexShrink: 0, fontWeight: 700, color: 'var(--accent)', background: 'var(--accent-soft)',
+            padding: '2px 8px', borderRadius: 999, whiteSpace: 'nowrap'
+          }} title="Time from page open to data fully loaded">
+            Loaded in {(loadElapsedMs / 1000).toFixed(2)}s
+          </span>
+        )}
       </div>
     </header>
   );
