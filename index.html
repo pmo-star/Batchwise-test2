@@ -762,10 +762,20 @@ function parsePlanCatchup(rows) {
 
   const out = [];
   let total = null;
+  let consecutiveBlanks = 0;
   for (let r = headerIdx + 1; r < rows.length; r++) {
     const row = rows[r];
     const name = (row[cProduct] || '').toString().trim();
-    if (!name) break; // blank row ends the table
+    if (!name) {
+      // Some tabs (e.g. FG Packing) have a single stray blank row right
+      // before the "Total" row, before the table truly ends — only treat
+      // TWO blank rows in a row as the real end, so that one lone blank
+      // doesn't hide the Total row that follows it.
+      consecutiveBlanks++;
+      if (consecutiveBlanks >= 2) break;
+      continue;
+    }
+    consecutiveBlanks = 0;
     const entry = {
       name,
       totalPlan: parseNum(row[cTotalPlan]),
@@ -777,6 +787,7 @@ function parsePlanCatchup(rows) {
     };
     if (name.toLowerCase() === 'total' || name.toLowerCase() === 'g.total') {
       total = entry;
+      break; // stop right after Total — rows below belong to a different table
     } else {
       out.push(entry);
     }
