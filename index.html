@@ -1982,6 +1982,35 @@ function MultiValueCell({ value }) {
 
 const TREND_LINE_COLORS = ['#B54E2E', '#2E6FBF', '#1E9E6B', '#D9A400', '#C0568A', '#6B4FBF', '#2AA198', '#C4453A', '#7A8B3F', '#8B5A2B'];
 
+// Draws the target's numeric value directly on its dashed line (near the
+// chart's right edge) — Chart.js has no built-in on-line data labels, so
+// this is a small custom plugin rather than pulling in an extra library.
+// Any dataset flagged `isTarget: true` gets its value drawn this way.
+const targetLineLabelPlugin = {
+  id: 'targetLineLabel',
+  afterDatasetsDraw(chart) {
+    const datasets = chart.data.datasets || [];
+    const idx = datasets.findIndex(d => d.isTarget);
+    if (idx === -1) return;
+    const ds = datasets[idx];
+    const yScale = chart.scales.y;
+    const chartArea = chart.chartArea;
+    if (!yScale || !chartArea) return;
+    const value = ds.data.find(v => v != null);
+    if (value == null) return;
+    const yPixel = yScale.getPixelForValue(value);
+    const ctx = chart.ctx;
+    const text = value.toFixed(2);
+    ctx.save();
+    ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif';
+    ctx.fillStyle = ds.borderColor || '#1E9E6B';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(text, chartArea.right - 4, yPixel - 3);
+    ctx.restore();
+  }
+};
+
 function buildAlloyTrendData(allRows, department, groupValues, groupField, fromDate, toDate, metricFields) {
   groupField = groupField || 'mat';
   metricFields = metricFields || ['total'];
@@ -2076,6 +2105,7 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
       if (target) {
         datasets.push({
           type: 'line',
+          isTarget: true,
           label: 'Target: ' + target.label + ' (' + target.value.toFixed(2) + ')',
           data: labels.map(() => target.value),
           borderColor: '#1E9E6B',
@@ -2087,6 +2117,7 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
       }
       chartRef.current = new Chart(canvasRef.current, {
         data: { labels, datasets },
+        plugins: [targetLineLabelPlugin],
         options: {
           responsive: true,
           maintainAspectRatio: false,
@@ -2109,6 +2140,7 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
 
     const datasets = target
       ? [...rateDatasets, {
+          isTarget: true,
           label: 'Target: ' + target.label + ' (' + target.value.toFixed(2) + ')',
           data: dates.map(() => target.value),
           borderColor: '#1E9E6B',
@@ -2122,6 +2154,7 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
     chartRef.current = new Chart(canvasRef.current, {
       type: 'line',
       data: { labels: dates.map(keyToLabel), datasets },
+      plugins: [targetLineLabelPlugin],
       options: {
         responsive: true,
         maintainAspectRatio: false,
@@ -2195,6 +2228,7 @@ function BatchRateBarChart({ rows, metricKey, yAxisLabel, ariaLabel }) {
     if (target) {
       datasets.push({
         type: 'line',
+        isTarget: true,
         label: 'Target: ' + target.name + ' (' + target.value.toFixed(2) + ')',
         data: capped.map(() => target.value),
         borderColor: '#1E9E6B',
@@ -2209,6 +2243,7 @@ function BatchRateBarChart({ rows, metricKey, yAxisLabel, ariaLabel }) {
         labels: capped.map(r => r.name),
         datasets
       },
+      plugins: [targetLineLabelPlugin],
       options: {
         responsive: true,
         maintainAspectRatio: false,
