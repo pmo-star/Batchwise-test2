@@ -60,6 +60,15 @@
 
   .focus-ring:focus-visible { outline: none; box-shadow: var(--focus); border-radius: var(--radius); }
 
+  .remark-input {
+    width: 100%; min-width: 220px; padding: 5px 8px; border-radius: 6px;
+    border: 1px solid transparent; background: transparent; color: var(--ink);
+    text-overflow: ellipsis;
+  }
+  .remark-input::placeholder { color: var(--ink-3); }
+  .remark-input:hover { border-color: var(--line-strong); }
+  .remark-input:focus { outline: none; border-color: var(--accent); background: var(--surface); box-shadow: var(--focus); }
+
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
   .spin { animation: spin 0.7s linear infinite; }
@@ -328,6 +337,38 @@ async function getAllRowsRemote() {
     rowsArr.forEach(r => all.push({ ...r, date: id }));
   });
   return all;
+}
+
+// REMARKS — free-text note per table row, typed in the dashboard.
+// Stored in their OWN collection ("remarks"), one small document per
+// remark, NOT inside batchRows: re-uploading a date replaces that date's
+// batchRows document completely, which would wipe any remark kept there.
+// One doc per remark also means two people editing different rows never
+// overwrite each other. Doc id = URL-safe base64 of the logical key (so it
+// never contains "/"); the readable key, dept, view and date are also kept
+// as fields so the documents are easy to read in the Firebase console.
+function remarkDocId(key) {
+  const bytes = new TextEncoder().encode(key);
+  let bin = '';
+  bytes.forEach(b => { bin += String.fromCharCode(b); });
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function remarkKeyFor(department, view, r) {
+  return department + '||' + view + '||' + r.key;
+}
+async function loadRemarks() {
+  const docs = await firestoreListCollection('remarks');
+  const out = {};
+  docs.forEach(({ data }) => { if (data && data.key && data.text) out[data.key] = data.text; });
+  return out;
+}
+async function saveRemark(meta, text) {
+  const path = 'remarks/' + remarkDocId(meta.key);
+  if (!text) { await firestoreDeleteDoc(path); return; }
+  await firestoreSetDoc(path, {
+    key: meta.key, dept: meta.dept, view: meta.view, date: meta.date,
+    text, updatedAt: Date.now()
+  });
 }
 
 function normalizeHeader(h) {
@@ -616,6 +657,7 @@ function aggregateBy(rows, keyFn, nameFn) {
 
     if (!buckets[k]) {
       buckets[k] = {
+        key: k,
         name: nameFn ? nameFn(r) : k,
         date: r.date,
         startTime: r.startTime != null ? r.startTime : null,
@@ -864,6 +906,9 @@ function App() {
   const [error, setError] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [toast, setToast] = useState(null);
+  const [remarks, setRemarks] = useState({});
+  const remarksRef = useRef({});
+  remarksRef.current = remarks;
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -875,6 +920,36 @@ function App() {
     setToast({ msg, isError });
     setTimeout(() => setToast(t => (t && t.msg === msg ? null : t)), isError ? 5000 : 3000);
   }, []);
+
+  // Remarks are small and independent of the (large) row data, so they load
+  // in parallel and never block the page; if this fails the table still
+  // works, the Remark cells are just empty.
+  useEffect(() => {
+    let cancelled = false;
+    loadRemarks().then(r => { if (!cancelled) setRemarks(prev => ({ ...r, ...prev })); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  // Saves on blur/Enter. Optimistic: the text shows immediately, and is
+  // rolled back with an error toast if Firestore rejects the write.
+  const handleRemarkSave = useCallback(async (meta, text) => {
+    const trimmed = (text || '').trim();
+    const before = remarksRef.current[meta.key] || '';
+    if (trimmed === before) return;
+    const apply = value => setRemarks(m => {
+      const n = { ...m };
+      if (value) n[meta.key] = value; else delete n[meta.key];
+      return n;
+    });
+    apply(trimmed);
+    try {
+      await saveRemark(meta, trimmed);
+      showToast(trimmed ? 'Remark saved' : 'Remark removed');
+    } catch (e) {
+      apply(before);
+      showToast('Remark could not be saved — ' + (e.message || 'unknown error'), true);
+    }
+  }, [showToast]);
 
   // The calendar/date picker uses the full list of dates that have data
   // (cheap to fetch — see listAvailableDates), not whatever happens to be
@@ -1005,6 +1080,7 @@ function App() {
     if (!files.length) return;
     setUploading(true);
     const loadedLabels = [];
+    const loadedKeys = [];
     const failed = [];
     let updatedRows = allRows ? allRows.slice() : [];
     try {
@@ -1022,6 +1098,7 @@ function App() {
             updatedRows = updatedRows.filter(r => r.date !== dk)
               .concat(byDate[dk].map(r => ({ ...r, date: dk })));
             loadedLabels.push(keyToLabel(dk));
+            loadedKeys.push(dk);
           }
         } catch (e) {
           failed.push(file.name + ': ' + (e.message || 'failed'));
@@ -1029,6 +1106,11 @@ function App() {
       }
 
       setAllRows(updatedRows);
+      // Make newly uploaded dates show up in the calendar / "has data" check
+      // right away (availableDates is otherwise only filled by loadAll).
+      if (loadedKeys.length) {
+        setAvailableDates(prev => Array.from(new Set([...prev, ...loadedKeys])).sort().reverse());
+      }
       const newDates = Array.from(new Set(updatedRows.map(r => r.date))).sort().reverse();
 
       if (loadedLabels.length) {
@@ -1230,40 +1312,41 @@ function App() {
     else setSearch(name);
   }
 
-  function handleExportCsv() {
+  function handleExportExcel() {
     if (!sortedFiltered.length) return;
+    if (typeof XLSX === 'undefined') { showToast('Excel library not loaded — check your connection and try again.', true); return; }
     const headers = COLS_AGG.map(([, label]) => label);
-    const lines = [headers.join(',')];
+    const aoa = [headers];
     sortedFiltered.forEach(r => {
       const cells = COLS_AGG.map(([key]) => {
         const isRateCol = key === 'rate' || key.endsWith('Rate');
         const isTextCol = key === 'name' || key === 'wc' || key === 'material' || key === 'matCode';
-        const isDateCol = key === 'date';
-        const isTimeCol = key === 'startTime' || key === 'endTime';
-        const isRunTimeCol = key === 'runTime';
-        let val;
-        if (isDateCol) val = keyToLabel(r[key]);
-        else if (isTimeCol) val = formatDateTime(r[key]);
-        else if (isRunTimeCol) val = formatRunTime(r[key]);
-        else if (isRateCol) val = r[key].toFixed(2);
-        else if (isTextCol) val = r[key] || '';
-        else val = Math.round(r[key]);
-        val = String(val);
-        return val.includes(',') ? '"' + val.replace(/"/g, '""') + '"' : val;
+        if (key === 'date') return keyToLabel(r[key]);
+        if (key === 'startTime' || key === 'endTime') return formatDateTime(r[key]);
+        if (key === 'runTime') return formatRunTime(r[key]);
+        if (key === 'remark') return remarks[remarkKeyFor(department, view, r)] || '';
+        if (isRateCol) return Number((r[key] || 0).toFixed(2));   // real number cell, 2 decimals
+        if (isTextCol) return r[key] || '';
+        return Math.round(r[key] || 0);                            // qty / batch count as real numbers
       });
-      lines.push(cells.join(','));
+      aoa.push(cells);
     });
-    const csv = lines.join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    // column widths based on longest value in each column
+    ws['!cols'] = headers.map((h, ci) => {
+      let max = String(h).length;
+      for (let ri = 1; ri < aoa.length; ri++) {
+        const len = String(aoa[ri][ci] == null ? '' : aoa[ri][ci]).length;
+        if (len > max) max = len;
+      }
+      return { wch: Math.min(Math.max(max + 2, 10), 50) };
+    });
+    const wb = XLSX.utils.book_new();
+    const sheetName = (department + ' ' + view).replace(/[\\\/?*\[\]:]/g, ' ').slice(0, 31);
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
     const rangeLabel = fromDate === toDate ? keyToLabel(fromDate) : keyToLabel(fromDate) + '_to_' + keyToLabel(toDate);
-    a.href = url;
-    a.download = 'batchwise_' + department.replace(/[^a-z0-9]+/gi, '_') + '_' + view + '_' + rangeLabel.replace(/\s+/g, '') + '.csv';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    const fileName = 'batchwise_' + department.replace(/[^a-z0-9]+/gi, '_') + '_' + view + '_' + rangeLabel.replace(/\s+/g, '') + '.xlsx';
+    XLSX.writeFile(wb, fileName);
   }
 
   const totals = useMemo(() => {
@@ -1306,7 +1389,10 @@ function App() {
     ['storeTotalRate', 'Total Store (Rs/kg)', 'right'],
     ['labTotalRate', 'Total Labour (Rs/kg)', 'right'],
     ['powerTotalRate', 'Total Power (Rs/kg)', 'right'],
-    ['rate', 'Total (Rs/kg)', 'right']
+    ['rate', 'Total (Rs/kg)', 'right'],
+    // Remark column is shown in every view (Machine wise, Alloy, Batch),
+    // right after Total (Rs/kg). Remarks are stored per dept + view + row key.
+    ['remark', 'Remark', 'left']
   ];
 
   return (
@@ -1315,7 +1401,7 @@ function App() {
         theme={theme} setTheme={setTheme}
         search={search} setSearch={setSearch}
         onUploadClick={() => fileInputRef.current && fileInputRef.current.click()}
-        onExport={handleExportCsv}
+        onExport={handleExportExcel}
         canExport={!!(rows && rows.length)}
         uploading={uploading}
         uploadProgress={uploadProgress}
@@ -1459,7 +1545,8 @@ function App() {
             />
           ) : (
             <DataTable cols={COLS_AGG} rows={sortedFiltered} fmt={fmt} fmtRate={fmtRate} view={view}
-              sortKey={sortKey} sortDir={sortDir} onSort={handleSort} onNameClick={handleNameClick} />
+              sortKey={sortKey} sortDir={sortDir} onSort={handleSort} onNameClick={handleNameClick}
+              department={department} remarks={remarks} onRemarkSave={handleRemarkSave} />
           )}
         </div>
       </main>
@@ -1524,7 +1611,7 @@ function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, c
             display: 'flex', alignItems: 'center', gap: 7, padding: '9px 14px', borderRadius: 8,
             border: '1px solid var(--line-strong)', background: 'var(--surface)', fontWeight: 600, fontSize: 13,
             opacity: canExport ? 1 : 0.5, cursor: canExport ? 'pointer' : 'not-allowed'
-          }} title={canExport ? 'Download current view as CSV' : 'No data to export yet'}>
+          }} title={canExport ? 'Download current view as Excel' : 'No data to export yet'}>
             <IconDownload />
             <span className="btn-label">Export</span>
           </button>
@@ -2232,6 +2319,7 @@ function BatchRateBarChart({ rows, metricKey, yAxisLabel, ariaLabel }) {
     if (chartRef.current) chartRef.current.destroy();
     const datasets = [{
       type: 'bar',
+      label: yAxisLabel || 'Rs / kg',
       data: capped.map(r => r[key]),
       backgroundColor: '#B54E2E',
       borderRadius: 4,
@@ -2341,7 +2429,42 @@ function BatchCostChart({ rows, title }) {
   );
 }
 
-function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort, onNameClick }) {
+// One editable Remark cell. Click and type to add or edit; it saves on blur
+// or Enter, and Escape throws the edit away. The x button (only shown when a
+// remark is saved) deletes it after a confirmation; clearing the text and
+// pressing Enter deletes it too.
+function RemarkCell({ value, onSave }) {
+  const [draft, setDraft] = useState(value || '');
+  const skipCommit = useRef(false);
+  useEffect(() => { setDraft(value || ''); }, [value]);
+  const commit = () => {
+    if (skipCommit.current) { skipCommit.current = false; return; }
+    if (draft.trim() !== (value || '')) onSave(draft);
+  };
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+      <input
+        type="text" className="remark-input" value={draft} maxLength={300}
+        placeholder="Add remark" aria-label="Remark" title={draft}
+        onChange={e => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={e => {
+          if (e.key === 'Enter') e.currentTarget.blur();
+          else if (e.key === 'Escape') { skipCommit.current = true; setDraft(value || ''); e.currentTarget.blur(); }
+        }}
+      />
+      {value ? (
+        <button type="button" className="focus-ring" aria-label="Delete remark" title="Delete remark"
+          onClick={() => { if (window.confirm('Delete this remark?')) onSave(''); }}
+          style={{ border: 'none', background: 'transparent', color: 'var(--ink-3)', fontSize: 18, lineHeight: 1, padding: '2px 8px', borderRadius: 6 }}>
+          {'×'}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort, onNameClick, department, remarks, onRemarkSave }) {
   return (
     <div style={{ overflowX: 'auto' }}>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
@@ -2349,12 +2472,13 @@ function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort, o
           <tr>
             {cols.map(([key, label, align]) => {
               const isActive = sortKey === key;
+              const sortable = !!onSort && key !== 'remark';
               return (
-                <th key={key} onClick={() => onSort && onSort(key)} style={{
+                <th key={key} onClick={() => sortable && onSort(key)} style={{
                   textAlign: align, padding: '10px 14px', fontSize: 12, fontWeight: 600,
                   color: isActive ? 'var(--accent)' : 'var(--ink-2)', borderBottom: '1px solid var(--line)', whiteSpace: 'nowrap',
                   position: 'sticky', top: 0, background: 'var(--surface)', zIndex: 2,
-                  cursor: onSort ? 'pointer' : 'default', userSelect: 'none'
+                  cursor: sortable ? 'pointer' : 'default', userSelect: 'none'
                 }}>
                   {label}{isActive ? (sortDir === 'asc' ? ' \u2191' : ' \u2193') : ''}
                 </th>
@@ -2368,6 +2492,15 @@ function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort, o
               onMouseEnter={e => e.currentTarget.style.background = 'var(--surface-2)'}
               onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
               {cols.map(([key, , align]) => {
+                if (key === 'remark') {
+                  const rk = remarkKeyFor(department, view, r);
+                  return (
+                    <td key={key} style={{ padding: '4px 8px', textAlign: 'left', borderBottom: '1px solid var(--line)', minWidth: 240 }}>
+                      <RemarkCell key={rk} value={(remarks && remarks[rk]) || ''}
+                        onSave={text => onRemarkSave && onRemarkSave({ key: rk, dept: department, view, date: r.date }, text)} />
+                    </td>
+                  );
+                }
                 const isName = key === 'name';
                 const isMono = isName && view === 'batch';
                 const isRateCol = key === 'rate' || key.endsWith('Rate');
