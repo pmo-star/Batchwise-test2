@@ -997,22 +997,34 @@ function App() {
   // If the user picks a date range that includes dates not loaded yet
   // (e.g. before the background history fill finishes), fetch just
   // those missing dates on demand instead of waiting for everything.
+  const rowsReady = allRows !== null;
   useEffect(() => {
     if (!fromDate || !toDate || !allRows) return;
     const lo = fromDate <= toDate ? fromDate : toDate;
     const hi = fromDate <= toDate ? toDate : fromDate;
     const needed = availableDates.filter(d => d >= lo && d <= hi);
+    // Single date + single machine selected -> also need the previous calendar
+    // day, because the machine/alloy bar charts show its Rs/kg as a dotted line.
+    if (lo === hi && selectedMachine) {
+      const pd = prevCalendarDay(lo);
+      if (pd && availableDates.includes(pd)) needed.push(pd);
+    }
     const loaded = new Set(allRows.map(r => r.date));
     const missing = needed.filter(d => !loaded.has(d));
     if (!missing.length) return;
     let cancelled = false;
     getRowsForDates(missing).then(extra => {
       if (cancelled) return;
-      setAllRows(prev => (prev || []).concat(extra));
-    });
+      // skip dates that arrived meanwhile (e.g. via the background history
+      // fill) so their rows are never added twice
+      setAllRows(prev => {
+        const have = new Set((prev || []).map(r => r.date));
+        return (prev || []).concat(extra.filter(r => !have.has(r.date)));
+      });
+    }).catch(() => {});
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fromDate, toDate, availableDates]);
+  }, [fromDate, toDate, availableDates, rowsReady, selectedMachine]);
 
   // load the saved Plan-sheet settings (ID + month suffix) once, the first
   // time the modal is opened — falls back to the hardcoded defaults if
@@ -1446,7 +1458,7 @@ function App() {
               <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>{m.label} cost per kg over time — by alloy</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — top 10 alloys by volume)</span>
             </div>
-            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeAlloyOptions}
+            <AlloyTrendChart showPrevDay={!!selectedMachine} allRows={searchedAllRows} department={department} alloys={allTimeAlloyOptions}
               groupField="mat" fromDate={fromDate} toDate={toDate} metricFields={m.fields}
               ariaLabel={m.label + ' cost per kg over time, one line per alloy.'} />
           </div>
@@ -1461,7 +1473,7 @@ function App() {
               <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>Total cost per kg over time — by alloy</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — top 10 alloys by volume — hover a point for qty too)</span>
             </div>
-            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeAlloyOptions}
+            <AlloyTrendChart showPrevDay={!!selectedMachine} allRows={searchedAllRows} department={department} alloys={allTimeAlloyOptions}
               groupField="mat" fromDate={fromDate} toDate={toDate}
               ariaLabel="Line chart of Rs per kg cost over time, one line per alloy. Hover a point to see quantity." />
           </div>
@@ -1476,7 +1488,7 @@ function App() {
               <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>{m.label} cost per kg over time — by machine</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all alloys combined per machine, {department} — top 10 machines by volume)</span>
             </div>
-            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeMachineOptions}
+            <AlloyTrendChart showPrevDay={!!selectedMachine} allRows={searchedAllRows} department={department} alloys={allTimeMachineOptions}
               groupField="wc" fromDate={fromDate} toDate={toDate} metricFields={m.fields}
               ariaLabel={m.label + ' cost per kg over time, one line per machine.'} />
           </div>
@@ -1491,7 +1503,7 @@ function App() {
               <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>Total cost per kg over time — by machine</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all alloys combined per machine, {department} — top 10 machines by volume — hover a point for qty too)</span>
             </div>
-            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeMachineOptions}
+            <AlloyTrendChart showPrevDay={!!selectedMachine} allRows={searchedAllRows} department={department} alloys={allTimeMachineOptions}
               groupField="wc" fromDate={fromDate} toDate={toDate}
               ariaLabel="Line chart of Rs per kg cost over time, one line per machine. Hover a point to see quantity." />
           </div>
@@ -2110,6 +2122,38 @@ const targetLineLabelPlugin = {
   }
 };
 
+// Draws the previous-day value as a dotted horizontal line across each bar
+// (width of the bar itself), dotted like the Target line, in a different
+// colour from the bar. Any dataset
+// flagged `isPrevDay: true` is drawn this way; bar dataset must be index 0.
+const prevDayLinePlugin = {
+  id: 'prevDayLine',
+  afterDatasetsDraw(chart) {
+    const datasets = chart.data.datasets || [];
+    const idx = datasets.findIndex(d => d.isPrevDay);
+    if (idx === -1) return;
+    const ds = datasets[idx];
+    const yScale = chart.scales.y;
+    const barMeta = chart.getDatasetMeta(0);
+    if (!yScale || !barMeta || !barMeta.data) return;
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.lineCap = 'butt';
+    (ds.data || []).forEach((v, i) => {
+      const bar = barMeta.data[i];
+      if (v == null || !bar) return;
+      const { x, width } = bar.getProps(['x', 'width'], true);
+      const y = yScale.getPixelForValue(v);
+      const x1 = x - width / 2 - 3, x2 = x + width / 2 + 3;
+      // same dotted/dashed style as the green "Target" line ([6, 4])
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x2, y);
+      ctx.strokeStyle = ds.borderColor || '#1F5FBF'; ctx.lineWidth = 3; ctx.stroke();
+    });
+    ctx.restore();
+  }
+};
+
 function buildAlloyTrendData(allRows, department, groupValues, groupField, fromDate, toDate, metricFields) {
   groupField = groupField || 'mat';
   metricFields = metricFields || ['total'];
@@ -2160,13 +2204,53 @@ function buildAlloyTrendData(allRows, department, groupValues, groupField, fromD
   return { dates, rateDatasets, qtyDatasets, totalQtyByDate };
 }
 
-function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, toDate, ariaLabel, metricFields, yAxisLabel }) {
+// Strictly the previous CALENDAR day of a 'YYYY-MM-DD' key (no skipping of
+// days without data) — e.g. 2026-11-24 -> 2026-11-23, 2026-12-01 -> 2026-11-30.
+function prevCalendarDay(key) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key || '');
+  if (!m) return null;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3] - 1));
+  return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0');
+}
+
+// Rs/kg (and qty) of each machine/alloy on one specific date, in the same
+// order as groupValues — used for the "previous day" marker on the
+// single-date bar chart. null = that machine/alloy has no data that day.
+function computePrevDayRates(allRows, department, groupValues, groupField, prevDate, metricFields) {
+  if (!allRows || !prevDate || !groupValues.length) return null;
+  metricFields = metricFields || ['total'];
+  const canonical = {};
+  groupValues.forEach(v => { canonical[normKey(v)] = v; });
+  const acc = {};
+  allRows.forEach(r => {
+    if (r.dept !== department || r.date !== prevDate) return;
+    const c = canonical[normKey(r[groupField])];
+    if (!c) return;
+    if (!acc[c]) acc[c] = { qty: 0, total: 0 };
+    acc[c].qty += r.qty;
+    acc[c].total += metricFields.reduce((sum, f) => sum + (r[f] || 0), 0);
+  });
+  const rates = groupValues.map(v => (acc[v] && acc[v].qty) ? acc[v].total / acc[v].qty : null);
+  const qtys = groupValues.map(v => acc[v] ? acc[v].qty : null);
+  return rates.some(v => v != null) ? { rates, qtys } : null;
+}
+
+function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, toDate, ariaLabel, metricFields, yAxisLabel, showPrevDay }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
 
   const { dates, rateDatasets, totalQtyByDate } = useMemo(
     () => buildAlloyTrendData(allRows, department, alloys, groupField, fromDate, toDate, metricFields),
     [allRows, department, alloys, groupField, fromDate, toDate, metricFields]
+  );
+
+  // Previous-day line: only when ONE machine is selected (showPrevDay) AND
+  // exactly ONE date is selected (From = To). With "All machines" or a
+  // multi-day range nothing changes.
+  const prevDate = (showPrevDay && fromDate && fromDate === toDate) ? prevCalendarDay(fromDate) : null;
+  const prevDay = useMemo(
+    () => computePrevDayRates(allRows, department, alloys, groupField, prevDate, metricFields),
+    [allRows, department, alloys, groupField, prevDate, metricFields]
   );
 
   // Target = whichever machine/alloy currently has the LOWEST cost per kg,
@@ -2196,11 +2280,32 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
       const values = rateDatasets.map(ds => (ds.data && ds.data[0] != null) ? ds.data[0] : null);
       const datasets = [{
         type: 'bar',
-        label: yAxisLabel || 'Rs / kg',
+        label: prevDay ? keyToLabel(dates[0]) : (yAxisLabel || 'Rs / kg'),
         data: values,
         backgroundColor: '#B54E2E',
-        borderRadius: 4
+        borderRadius: 4,
+        order: 2            // drawn first (underneath) so the previous-day marker is never hidden behind a bar
       }];
+      if (prevDay) {
+        // line across each machine/alloy's bar = its Rs/kg on the previous calendar day
+        // (drawn by prevDayLinePlugin; the dataset itself shows no dots)
+        datasets.push({
+          type: 'line',
+          isPrevDay: true,
+          label: 'Previous day (' + keyToLabel(prevDate) + ')',
+          data: prevDay.rates,
+          qty: prevDay.qtys,
+          order: 0,
+          showLine: false,
+          spanGaps: false,
+          fill: false,
+          pointRadius: 0,
+          pointHoverRadius: 0,
+          borderWidth: 3,
+          borderColor: '#1F5FBF',
+          backgroundColor: '#1F5FBF'
+        });
+      }
       if (target) {
         datasets.push({
           type: 'line',
@@ -2216,15 +2321,26 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
       }
       chartRef.current = new Chart(canvasRef.current, {
         data: { labels, datasets },
-        plugins: [targetLineLabelPlugin],
+        plugins: [targetLineLabelPlugin, prevDayLinePlugin],
         options: {
           responsive: true,
           maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
           plugins: {
             legend: { display: true, position: 'bottom', labels: { boxWidth: 12, boxHeight: 12, font: { size: 11 } } },
             tooltip: {
               callbacks: {
-                label: ctx => ctx.dataset.label + ': ' + (ctx.parsed.y != null ? ctx.parsed.y.toFixed(2) + ' Rs/kg' : 'no data')
+                label: ctx => ctx.dataset.label + ': ' + (ctx.parsed.y != null ? ctx.parsed.y.toFixed(2) + ' Rs/kg' : 'no data'),
+                afterLabel: ctx => {
+                  let q = null;
+                  if (ctx.dataset.type === 'bar') {
+                    const ds = rateDatasets[ctx.dataIndex];
+                    q = ds && ds.qty ? ds.qty[0] : null;
+                  } else if (ctx.dataset.qty) {
+                    q = ctx.dataset.qty[ctx.dataIndex];
+                  }
+                  return q != null ? 'Qty: ' + Math.round(q).toLocaleString('en-IN') + ' kg' : undefined;
+                }
               }
             }
           },
@@ -2282,7 +2398,7 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
       }
     });
     return () => { if (chartRef.current) chartRef.current.destroy(); };
-  }, [dates, rateDatasets, totalQtyByDate, target, singleDay, yAxisLabel]);
+  }, [dates, rateDatasets, totalQtyByDate, target, singleDay, yAxisLabel, prevDay, prevDate]);
 
   if (!rateDatasets.length) {
     return <div style={{ fontSize: 13, color: 'var(--ink-2)', padding: '12px 0' }}>No trend data yet.</div>;
